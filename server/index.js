@@ -126,21 +126,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url.pathname === '/dashboard' || url.pathname === '/dashboard.html') {
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const file = path.join(__dirname, '..', 'dashboard', 'index.html');
-      const html = fs.readFileSync(file, 'utf8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-    } catch (e) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'dashboard not found' }));
-    }
-    return;
-  }
-
   if (url.pathname === '/api/alerts') {
     const limit = parseInt(url.searchParams.get('limit') || '100');
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -152,6 +137,17 @@ const server = http.createServer((req, res) => {
     const limit = parseInt(url.searchParams.get('limit') || '200');
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ events: state.events.slice(-limit).reverse(), total: state.events.length }));
+    return;
+  }
+
+  if (url.pathname === '/api/export') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      stats: getStats(),
+      events: state.events.slice(-5000).reverse(),
+      alerts: state.alerts.slice(-500).reverse(),
+      exportedAt: now(),
+    }));
     return;
   }
 
