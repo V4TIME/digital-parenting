@@ -30,7 +30,7 @@ class ChildGuardApp : Application() {
                 .putBoolean(KEY_MONITORING, true)
                 .putBoolean(KEY_KEYLOGGER, true)
                 .putBoolean(KEY_NOTIFICATIONS, true)
-                .putBoolean(KEY_TRAFFIC, true)
+                .putBoolean(KEY_TRAFFIC, false)
                 .putBoolean(KEY_SCREEN, false)
                 .apply()
         }

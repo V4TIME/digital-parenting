@@ -35,3 +35,13 @@ CHILDGUARD_TOKEN=your-secret node index.js
 
 The app pushes events to `POST /api/events`; the parent terminal pulls them
 with `GET /api/events` / `GET /api/alerts` (or `GET /api/export`).
+
+## Android 15 ready
+
+The app targets SDK 35 (Android 15): `compileSdk 35` / `targetSdk 35`.
+- `MonitorService` runs as a low-importance foreground service with a declared
+  `foregroundServiceType="specialUse"` (required by Android 15) so monitoring
+  survives modern background culling.
+- `POST_NOTIFICATIONS` runtime permission is requested on Android 13+.
+- Accessibility service and notification listener require user enablement in
+  system settings (unchanged across Android 13–15).
