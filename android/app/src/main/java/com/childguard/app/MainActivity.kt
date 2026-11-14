@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.childguard.app.R
 
 class MainActivity : AppCompatActivity() {
@@ -35,6 +36,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         requestNotificationPermission()
+
+        // Auto-start monitoring foreground service once setup is complete.
+        if (setupDone && sp.getBoolean(ChildGuardApp.KEY_MONITORING, true)) {
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, MonitorService::class.java).setAction("childguard.START")
+            )
+        }
     }
 
     /** Android 13+ requires runtime permission before posting any notification. */

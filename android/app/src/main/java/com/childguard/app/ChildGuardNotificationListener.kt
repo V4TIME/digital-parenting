@@ -2,7 +2,7 @@ package com.childguard.app
 
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.support.v4.app.NotificationCompat
+import androidx.core.app.NotificationCompat
 import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -20,7 +20,7 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             "com.snapchat.android", "com.discord", "com.telegram.messenger",
             "com.kik.chat", "com.skype.raider", "com.pinterest",
             "com.facebook.katana", "com.facebook.orca", "com.messenger",
-            "com.linecorp.android", "com.viber VoIP", "com.viber VoIP",
+            "com.linecorp.android", "com.viber.voip",
             "com.google.android.apps.messenger", "com.android.mms"
         )
 
@@ -33,7 +33,8 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             Regex("(?i)(you'?re\\s+(so\\s+)?(cute|hot|pretty|nice|beautiful))"),
             Regex("(?i)(add\\s+me|add\\s+you|follow\\s+me|friend\\s+me)"),
             Regex("(?i)(your\\s+(mom|dad|parents|mother|father))"),
-            Regex("(?i)(\\b\\d{3,}\\s*[-.]?\\s*\\d{3,}\\s*[-.]?\\s*\\d{4,}\\b)")
+            Regex("(?i)(\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4})"),
+            Regex("(?i)(\\d{10,})")
         )
 
         fun isStrangerText(text: String): Boolean {
@@ -42,7 +43,8 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             return STRANGER_HINTS.any { it.containsMatchIn(t) }
         }
 
-        fun isChatApp(pkg: String): Boolean = CHAT_PACKAGES.any { pkg.equals(it, true) || pkg.startsWith(it) }
+        fun isChatApp(pkg: String): Boolean =
+            CHAT_PACKAGES.any { pkg.equals(it, true) || pkg.startsWith(it) }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -52,9 +54,9 @@ class ChildGuardNotificationListener : NotificationListenerService() {
 
         val pkg = sbn.packageName
         val extras = sbn.notification.extras
-        val title = extras.getCharSequence(NotificationCompat.title)?.toString() ?: ""
-        val text = extras.getCharSequence(NotificationCompat.text)?.toString() ?: ""
-        val bigText = extras.getCharSequence(NotificationCompat.bigText)?.toString() ?: ""
+        val title = extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString() ?: ""
+        val text = extras.getCharSequence(NotificationCompat.EXTRA_TEXT)?.toString() ?: ""
+        val bigText = extras.getCharSequence(NotificationCompat.EXTRA_BIG_TEXT)?.toString() ?: ""
 
         val combined = listOf(title, text, bigText).filter { it.isNotBlank() }.joinToString(" | ")
         if (combined.length < 3) return
@@ -69,27 +71,12 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             put("is_chat_app", isChatApp(pkg))
         }
 
-        if (isChatApp(pkg)) {
-            obj.put("chat", true)
-            if (isStrangerText(combined)) {
-                obj.put("stranger_alert", true)
-                enqueueEvent("stranger_notification", pkg, combined)
-            }
+        if (isChatApp(pkg) && isStrangerText(combined)) {
+            obj.put("stranger_alert", true)
+            obj.put("data", combined)
+            while (queue.size > MAX_QUEUE) queue.poll()
+            queue.add(obj)
         }
-
-        while (queue.size > MAX_QUEUE) queue.poll()
-        queue.add(obj)
-    }
-
-    private fun enqueueEvent(type: String, pkg: String, data: String) {
-        val obj = JSONObject().apply {
-            put("type", type)
-            put("package", pkg)
-            put("data", data)
-            put("ts", System.currentTimeMillis())
-        }
-        while (queue.size > MAX_QUEUE) queue.poll()
-        queue.add(obj)
     }
 
     override fun onListenerConnected() {

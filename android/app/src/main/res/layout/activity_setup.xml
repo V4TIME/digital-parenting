@@ -3,76 +3,34 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="24dp"
-    android:background="#1a1a2e">
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Setup ChildGuard"
-        android:textSize="28sp"
-        android:textColor="#e94560"
-        android:layout_marginBottom="24dp" />
+    android:padding="20dp">
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Step 1: Enable Accessibility"
-        android:textColor="#ffffff"
-        android:textSize="18sp" />
+        android:text="ChildGuard Setup"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:paddingBottom="20dp" />
 
     <Button
         android:id="@+id/btn_enable_accessibility"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Enable Accessibility Service"
-        android:backgroundTint="#e94560"
-        android:textColor="#ffffff"
-        android:padding="12dp"
-        android:layout_marginBottom="20dp" />
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Step 2: Enable Notification Access"
-        android:textColor="#ffffff"
-        android:textSize="18sp" />
+        android:text="Enable Accessibility" />
 
     <Button
         android:id="@+id/btn_enable_notifications"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Enable Notification Listener"
-        android:backgroundTint="#e94560"
-        android:textColor="#ffffff"
-        android:padding="12dp"
-        android:layout_marginBottom="20dp" />
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Step 3: Child's Name"
-        android:textColor="#ffffff"
-        android:textSize="18sp" />
-
-    <EditText
-        android:id="@+id/edit_child_name"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="Enter child's name"
-        android:textColor="#ffffff"
-        android:textColorHint="#888888"
-        android:background="#16213e"
-        android:padding="12dp"
-        android:layout_marginBottom="20dp" />
+        android:text="Enable Notification Access"
+        android:layout_marginTop="12dp" />
 
     <Button
         android:id="@+id/btn_finish"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="Finish Setup"
-        android:backgroundTint="#e94560"
-        android:textColor="#ffffff"
-        android:padding="16dp" />
+        android:layout_marginTop="12dp" />
 
 </LinearLayout>
