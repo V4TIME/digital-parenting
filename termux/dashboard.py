@@ -166,7 +166,7 @@ def set_cfg(con, key, value):
 # --------------------------------------------------------------------------
 # Server sync
 # --------------------------------------------------------------------------
-def http_get_json(url, token, timeout=20):
+def http_get_json(url, token, timeout=10):
     req = urllib.request.Request(url)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
