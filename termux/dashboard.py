@@ -120,9 +120,22 @@ LAST_SYNC_KEY = "last_sync"
 def ensure_env():
     for d in (BASE, EXPORT_DIR):
         os.makedirs(d, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except Exception:
+            pass
     con = sqlite3.connect(DB_PATH)
     con.executescript(SCHEMA)
     con.commit()
+    try:
+        os.chmod(DB_PATH, 0o600)
+    except Exception:
+        pass
+    if os.path.exists(CONFIG_PATH):
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except Exception:
+            pass
     return con
 
 
@@ -533,11 +546,19 @@ def do_export(con):
                 "blocklist": get_cfg(con, BLOCKLIST_KEY, []),
                 "configured_server": load_config().get("server"),
             }, f, indent=2)
+        try:
+            os.chmod(cfg_snapshot, 0o600)
+        except Exception:
+            pass
         tar.add(cfg_snapshot, arcname="config_snapshot.json")
 
     os.remove(tmp_json)
     os.remove(tmp_alerts)
     os.remove(cfg_snapshot)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
     print(green(f"  exported → {path}"))
 
 
