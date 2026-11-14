@@ -1,0 +1,16 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode { failOnProjectRepositories() }
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "childguard"
+include ':app'

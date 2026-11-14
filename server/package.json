@@ -1,0 +1,10 @@
+{
+  "name": "childguard-server",
+  "version": "1.0.0",
+  "description": "ChildGuard monitoring server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "MIT"
+}
