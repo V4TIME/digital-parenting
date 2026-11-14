@@ -3,6 +3,7 @@ package com.childguard.app
 import android.content.Intent
 import android.os.Bundle
 import android.widget.Button
+import android.widget.EditText
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 
@@ -12,11 +13,16 @@ class SetupActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_setup)
 
-        val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE).edit()
+        val prefs = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
 
+        val editServer = findViewById<EditText>(R.id.edit_server_url)
+        val editToken = findViewById<EditText>(R.id.edit_token)
         val btnEnableAccessibility = findViewById<Button>(R.id.btn_enable_accessibility)
         val btnEnableNotifications = findViewById<Button>(R.id.btn_enable_notifications)
         val btnFinish = findViewById<Button>(R.id.btn_finish)
+
+        editServer.setText(prefs.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER))
+        editToken.setText(prefs.getString(ChildGuardApp.KEY_PARENT_TOKEN, ""))
 
         btnEnableAccessibility.setOnClickListener {
             startActivity(Intent("android.settings.ACCESSIBILITY_SETTINGS"))
@@ -29,7 +35,13 @@ class SetupActivity : AppCompatActivity() {
         }
 
         btnFinish.setOnClickListener {
-            sp.putBoolean("setup_done", true).apply()
+            val server = editServer.text?.toString()?.trim().orEmpty()
+            val token = editToken.text?.toString()?.trim().orEmpty()
+            prefs.edit()
+                .putString(ChildGuardApp.KEY_SERVER_URL, server.ifEmpty { ChildGuardApp.DEFAULT_SERVER })
+                .putString(ChildGuardApp.KEY_PARENT_TOKEN, token)
+                .putBoolean("setup_done", true)
+                .apply()
             startActivity(Intent(this, DashboardActivity::class.java))
             finish()
         }

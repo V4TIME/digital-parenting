@@ -110,7 +110,11 @@ const server = http.createServer((req, res) => {
         return;
       }
       const child = state.children.get(d.childId);
-      if (!child) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'child not found' })); return; }
+      if (!child) {
+        // Auto-register unknown child ids so events are never dropped.
+        child = { id: d.childId, name: 'Child', token: '', lastSeen: now(), registeredAt: now() };
+        state.children.set(child.id, child);
+      }
       child.lastSeen = now();
       const events = Array.isArray(d.events) ? d.events : [d.events];
       for (const ev of events) addEvent(child.id, ev);

@@ -16,7 +16,6 @@ import org.json.JSONObject
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
@@ -169,7 +168,6 @@ class MonitorService : Service() {
         val merged = ArrayList<JSONObject>()
 
         // drain accessibility service queue
-        ChildGuardAccessibilityService.eventQueue.poll()?.let { merged.add(it) }
         while (ChildGuardAccessibilityService.eventQueue.isNotEmpty() && merged.size < MAX_BATCH) {
             ChildGuardAccessibilityService.eventQueue.poll()?.let { merged.add(it) }
         }
@@ -187,14 +185,11 @@ class MonitorService : Service() {
 
         if (merged.isEmpty()) return
 
+        val childId = ensureRegistered() ?: return
+
         val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
         val serverUrl = sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: return
         val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
-        var childId = sp.getString("child_id", "")
-        if (childId.isNullOrEmpty()) {
-            childId = UUID.randomUUID().toString()
-            sp.edit().putString("child_id", childId).apply()
-        }
 
         val body = JSONObject().apply {
             put("childId", childId)
@@ -220,6 +215,50 @@ class MonitorService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "upload error: ${e.message}")
         }
+    }
+
+    /**
+     * Ensure this device is registered on the parent server.
+     * Runs once; if the server is unreachable it returns null and the next
+     * upload cycle retries. Returns the persisted child id when registered.
+     */
+    private fun ensureRegistered(): String? {
+        val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
+        val existing = sp.getString("child_id", "")
+        if (!existing.isNullOrEmpty()) return existing
+
+        val serverUrl = sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: return null
+        val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
+        val name = sp.getString(ChildGuardApp.KEY_CHILD_NAME, "Child") ?: "Child"
+
+        val body = JSONObject().put("name", name)
+        try {
+            val conn = URL("$serverUrl/api/register").openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 10_000
+            conn.readTimeout = 10_000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            if (token.isNotEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer $token")
+            }
+            (conn.outputStream as OutputStream).write(body.toString().toByteArray(Charsets.UTF_8))
+            val code = conn.responseCode
+            if (code == 200) {
+                val text = conn.inputStream.bufferedReader().readText()
+                conn.disconnect()
+                val childId = JSONObject(text).optString("childId")
+                if (childId.isNotEmpty()) {
+                    sp.edit().putString("child_id", childId).apply()
+                    return childId
+                }
+            } else {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "registration error: ${e.message}")
+        }
+        return null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
