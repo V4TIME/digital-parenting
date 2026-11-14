@@ -1,0 +1,20 @@
+[Unit]
+Description=ChildGuard collector server (Rust)
+After=network.target
+
+[Service]
+Type=simple
+Environment=CHILDGUARD_TOKEN=change-me
+Environment=PORT=38080
+Environment=BIND=0.0.0.0
+ExecStart=/opt/childguard-server/childguard-server
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+
+[Install]
+WantedBy=multi-user.target

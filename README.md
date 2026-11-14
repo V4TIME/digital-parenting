@@ -7,12 +7,19 @@ content, and hands parents a full control surface.
 ## Components
 
 ```
-android/    Android app (Kotlin): accessibility monitor, VPN filter, notification listener,
-            dashboard activities, event upload to server
-server/     Node.js collector: receives events, stores state, serves stats/export to parents
-termux/     Termux parent dashboard (terminal, no HTML): logs, screen time, alerts,
-            keyword flags, blocklist, sync, export, cleanup
+android/        Android app (Kotlin): accessibility monitor, notification listener,
+                dashboard activities, event upload to server (targets Android 15)
+server/         [legacy] Node.js collector (same API)
+server-rust/    [recommended] Rust collector server — single binary, hardened,
+                drop-in replacement for server/
+termux/         Termux parent dashboard (terminal, no HTML): logs, screen time, alerts,
+                keyword flags, blocklist, sync, export, cleanup
 ```
+
+The **Rust server** (`server-rust/`) is the recommended deployment: same API as
+the Node collector, so the app and Termux dashboard work unchanged, but built as
+one static, dependency-light binary with constant-time auth and hardened input
+handling.
 
 ## The parent dashboard (Termux)
 
@@ -27,10 +34,20 @@ See `termux/README.md` for the full feature list and usage.
 
 ## Quick start (server)
 
+Recommended — Rust collector (single binary):
+
+```bash
+cd server-rust
+cargo build --release
+CHILDGUARD_TOKEN=your-secret ./target/release/childguard-server
+# prints the parent token and port (default 38080)
+```
+
+Legacy Node collector (same API):
+
 ```bash
 cd server
 CHILDGUARD_TOKEN=your-secret node index.js
-# prints the parent token and port (default 38080)
 ```
 
 The app pushes events to `POST /api/events`; the parent terminal pulls them
