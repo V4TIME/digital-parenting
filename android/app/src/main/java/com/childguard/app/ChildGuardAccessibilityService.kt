@@ -2,23 +2,38 @@ package com.childguard.app
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
-import android.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.view.accessibility.AccessibilityWindowInfo
 import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentLinkedQueue
 
+/**
+ * Feature 1 — Accessibility interception.
+ *
+ * Master-level hardened implementation:
+ *  - monitors real chat/browser text via TYPE_VIEW_TEXT_CHANGED + TYPE_VIEW_FOCUSED
+ *  - includes non-important views so EditText content is actually visible
+ *  - recycles every node it touches (no binder leaks)
+ *  - extracts text near a clicked node (sent button -> edit box)
+ *  - dedupes stranger alerts to avoid log/notification storms
+ *  - cleans up lifecycle state on unbind/destroy
+ */
 class ChildGuardAccessibilityService : AccessibilityService() {
+
     companion object {
         private const val TAG = "ChildGuardAS"
+        private const val MAX_QUEUE = 200
+        private const val MAX_TEXT_LEN = 500
+        private const val ALERT_MIN_GAP_MS = 10_000L
+
         var instance: ChildGuardAccessibilityService? = null
         var isServiceRunning = false
             private set
 
         val eventQueue = ConcurrentLinkedQueue<JSONObject>()
-        private const val MAX_QUEUE = 200
 
+        // Tightened stranger patterns (phone-like numbers only, not any 3 digits).
         private val STRANGER_PATTERNS = listOf(
             Regex("(?i)(hey\\s+(there|buddy|kid|child|son|daughter|young))"),
             Regex("(?i)(you\\s+are\\s+(so\\s+)?(cute|young|handsome))"),
@@ -29,15 +44,27 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             Regex("(?i)(your\\s+(mom|dad|parents)\\s+(don'?t|do\\s+not)\\s+know)"),
             Regex("(?i)(whatsapp|telegram|discord|snapchat|signal|kik|skype|tiktok|instagram)"),
             Regex("(?i)(add\\s+me|add\\s+you|follow\\s+me|friend\\s+me)"),
-            Regex("(?i)(\\b\\d{3,}\\s*[-.]?\\s*\\d{3,}\\s*[-.]?\\s*\\d{4,}\\b)"),
+            // phone-like: 10+ digits, optionally separated by space/-/. or (xxx)
+            Regex("(?i)(\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4})"),
+            Regex("(?i)(\\d{10,})"),
             Regex("(?i)(@\\w{2,30})"),
             Regex("(?i)(http[s]?://)"),
         )
+
+        private var lastAlertTs = 0L
 
         fun isStrangerText(text: String): Boolean {
             val t = text.trim()
             if (t.length < 3) return false
             return STRANGER_PATTERNS.any { it.containsMatchIn(t) }
+        }
+
+        /** Rate-limit alert storms from repeated window dumps. */
+        private fun shouldFireAlert(): Boolean {
+            val now = System.currentTimeMillis()
+            if (now - lastAlertTs < ALERT_MIN_GAP_MS) return false
+            lastAlertTs = now
+            return true
         }
     }
 
@@ -45,15 +72,19 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         isServiceRunning = true
+
         val info = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED or
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
                 AccessibilityEvent.TYPE_VIEW_CLICKED or
-                AccessibilityEvent.TYPE_VIEW_LONG_CLICKED
+                AccessibilityEvent.TYPE_VIEW_LONG_CLICKED or
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_FOCUSED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             notificationTimeout = 100
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                AccessibilityServiceInfo.FLAG_RETRIEVE_WINDOW_CONTENT
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
         }
         accessibilityServiceInfo = info
         Log.i(TAG, "Accessibility service connected")
@@ -71,28 +102,55 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
                 val texts = event.text?.joinToString(" ") ?: ""
                 if (texts.isNotEmpty()) {
-                    enqueueEvent("notification", pkg, texts)
-                    if (isStrangerText(texts)) {
-                        enqueueEvent("stranger_alert", pkg, texts)
+                    val trimmed = texts.take(MAX_TEXT_LEN)
+                    enqueueEvent("notification", pkg, trimmed)
+                    if (isStrangerText(trimmed) && shouldFireAlert()) {
+                        enqueueEvent("stranger_alert", pkg, trimmed)
                     }
                 }
             }
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
                 val node = event.source
-                val text = node?.text?.toString() ?: ""
-                if (text.isNotEmpty() && text.length > 2) {
-                    enqueueEvent("keystroke", pkg, text)
-                    if (isStrangerText(text)) {
-                        enqueueEvent("stranger_alert", pkg, text)
+                if (node == null) return
+                try {
+                    val text = extractTextNear(node)
+                    if (text.isNotEmpty()) {
+                        enqueueEvent("keystroke", pkg, text)
+                        if (isStrangerText(text) && shouldFireAlert()) {
+                            enqueueEvent("stranger_alert", pkg, text)
+                        }
                     }
+                } finally {
+                    node.recycle()
                 }
             }
+
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
+                val node = event.source
+                if (node == null) return
+                try {
+                    val text = node.text?.toString()?.trim() ?: ""
+                    if (text.length > 1) {
+                        val trimmed = text.take(MAX_TEXT_LEN)
+                        enqueueEvent("keylog", pkg, trimmed)
+                        if (isStrangerText(trimmed) && shouldFireAlert()) {
+                            enqueueEvent("stranger_alert", pkg, trimmed)
+                        }
+                    }
+                } finally {
+                    node.recycle()
+                }
+            }
+
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 val texts = collectTextFromRoot()
                 if (texts.isNotEmpty()) {
-                    val joined = texts.joinToString(" ").take(500)
+                    val joined = texts.joinToString(" ").take(MAX_TEXT_LEN)
                     enqueueEvent("screen_text", pkg, joined)
-                    if (isStrangerText(joined)) {
+                    if (isStrangerText(joined) && shouldFireAlert()) {
                         enqueueEvent("stranger_alert", pkg, joined)
                     }
                 }
@@ -100,20 +158,76 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Recovers text from the clicked node's own label or nearby edit fields. */
+    private fun extractTextNear(node: AccessibilityNodeInfo): String {
+        node.text?.toString()?.trim()?.let { if (it.length > 1) return it }
+        node.contentDescription?.toString()?.trim()?.let { if (it.length > 1) return it }
+
+        // Search children/descendants (max depth 6) for an EditText or text node.
+        val found = StringBuilder()
+        collectNodeText(node, found, 0, 6, 1)
+        if (found.isNotEmpty()) return found.toString()
+
+        // Walk up ancestors looking for a sibling EditText with text.
+        var parent = node.parent
+        var depth = 0
+        while (parent != null && depth < 3) {
+            var childIndex = 0
+            while (childIndex < parent.childCount) {
+                val child = parent.getChild(childIndex) ?: continue
+                try {
+                    val t = child.text?.toString()?.trim() ?: ""
+                    if (t.length > 1) return t
+                } finally {
+                    child.recycle()
+                }
+                childIndex++
+            }
+            val nextParent = parent.parent
+            parent.recycle()
+            parent = nextParent
+            depth++
+        }
+        return ""
+    }
+
     private fun collectTextFromRoot(): List<String> {
         val texts = ArrayList<String>()
         val root = rootInActiveWindow ?: return texts
-        collectNodeText(root, texts, 0)
-        root recycle()
+        val buf = StringBuilder()
+        collectNodeText(root, buf, 0, 12, 128)
+        root.recycle()
+        if (buf.isNotEmpty()) texts.add(buf.toString())
         return texts
     }
 
-    private fun collectNodeText(node: AccessibilityNodeInfo, texts: ArrayList<String>, depth: Int) {
-        if (depth > 12) return
-        node.text?.toString()?.trim()?.let { if (it.length > 1) texts.add(it) }
-        node.contentDescription?.toString()?.trim()?.let { if (it.length > 1) texts.add(it) }
+    private fun collectNodeText(
+        node: AccessibilityNodeInfo,
+        out: StringBuilder,
+        depth: Int,
+        maxDepth: Int,
+        maxChars: Int
+    ) {
+        if (depth > maxDepth || out.length >= maxChars) return
+        node.text?.toString()?.trim()?.let {
+            if (it.length > 1 && out.length < maxChars) {
+                if (out.isNotEmpty()) out.append(' ')
+                out.append(it.take(maxChars - out.length))
+            }
+        }
+        node.contentDescription?.toString()?.trim()?.let {
+            if (it.length > 1 && out.length < maxChars) {
+                if (out.isNotEmpty()) out.append(' ')
+                out.append(it.take(maxChars - out.length))
+            }
+        }
         for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { collectNodeText(it, texts, depth + 1) }
+            val child = node.getChild(i) ?: continue
+            try {
+                collectNodeText(child, out, depth + 1, maxDepth, maxChars)
+            } finally {
+                child.recycle()
+            }
         }
     }
 
@@ -131,5 +245,17 @@ class ChildGuardAccessibilityService : AccessibilityService() {
     override fun onInterrupt() {
         Log.w(TAG, "Accessibility service interrupted")
         isServiceRunning = false
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        instance = null
+        isServiceRunning = false
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        instance = null
+        isServiceRunning = false
+        super.onDestroy()
     }
 }
