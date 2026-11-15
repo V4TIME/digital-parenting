@@ -20,6 +20,12 @@ class ChildGuardNotificationListener : NotificationListenerService() {
         private const val TAG = "ChildGuardNL"
         private const val MAX_QUEUE = 200
 
+        /** True while the system notification listener is bound. Feature 1 uses
+         * this to skip its own notification fallback, preventing the same
+         * notification from being counted twice. */
+        var isListenerConnected = false
+            private set
+
         val instance: ChildGuardNotificationListener? = null
 
         val queue = ConcurrentLinkedQueue<JSONObject>()
@@ -55,6 +61,11 @@ class ChildGuardNotificationListener : NotificationListenerService() {
 
         fun isChatApp(pkg: String): Boolean =
             CHAT_PACKAGES.any { pkg.equals(it, true) || pkg.startsWith(it) }
+
+        /** Single source of truth for the event type of a notification, so a
+         * stranger hit is always delivered as an alertable type. */
+        fun classify(combined: String): String =
+            if (isStrangerText(combined)) "stranger_notification" else "notification"
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -86,6 +97,9 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             if (isStrangerText(combined)) {
                 obj.put("stranger_alert", true)
                 obj.put("data", combined)
+                // Emit a distinct type so the collector raises an alert;
+                // otherwise the flag would sit invisible in the event stream.
+                obj.put("type", classify(combined))
             }
         } else {
             obj.put("chat", false)
@@ -97,10 +111,12 @@ class ChildGuardNotificationListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        isListenerConnected = true
         Log.i(TAG, "Notification listener connected")
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        isListenerConnected = false
     }
 }

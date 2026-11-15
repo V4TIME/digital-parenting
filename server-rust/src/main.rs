@@ -113,7 +113,7 @@ fn persist_state_to(st: &AppState, dir: &std::path::Path) {
     let final_path = dir.join("state.json");
     let res = (|| -> std::io::Result<()> {
         let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
-        serde_json::to_writer(&mut f, &snapshot).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        serde_json::to_writer(&mut f, &snapshot).map_err(std::io::Error::other)?;
         f.flush()?;
         drop(f);
         fs::rename(&tmp, &final_path)?;
@@ -532,10 +532,13 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
             st.events.pop_front();
         }
         if type_ == "stranger_alert" || type_ == "stranger_notification" {
+            // Severity reflects real risk: a stranger reaching the child is
+            // high, a stranger notification is medium. Never "info".
+            let severity = if type_ == "stranger_alert" { "high" } else { "medium" };
             let alert = Alert {
                 id: uid("a"),
                 ts,
-                severity: "info".to_string(),
+                severity: severity.to_string(),
                 reason: type_.clone(),
                 detail: serde_json::to_string(&ev).unwrap_or_default(),
             };
@@ -916,6 +919,20 @@ mod tests {
         let st = state.lock().unwrap();
         assert!(st.children.len() <= MAX_CHILDREN);
         let _ = now;
+    }
+
+    #[test]
+    fn stranger_alerts_get_meaningful_severity() {
+        let state = test_state("secret");
+        let body = r#"{"childId":"cg_sev","events":[
+            {"type":"stranger_alert","package":"com.whatsapp","data":"dont tell your parents","ts":1},
+            {"type":"stranger_notification","package":"com.whatsapp","data":"hey kid","ts":2}
+        ]}"#;
+        let (_c, _v) = handle_events(&state, body.as_bytes()).unwrap();
+        let st = state.lock().unwrap();
+        assert_eq!(st.alerts.len(), 2);
+        assert_eq!(st.alerts[0].severity, "high");
+        assert_eq!(st.alerts[1].severity, "medium");
     }
 
     #[test]

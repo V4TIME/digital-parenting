@@ -30,7 +30,23 @@ pkg update && pkg install python
 ./termux/dashboard.sh
 ```
 
+Headless (scripted) usage:
+
+```bash
+python3 termux/dashboard.py --configure --server http://<tailscale-ip>:38080 --token <token>
+python3 termux/dashboard.py --sync --overview
+python3 termux/dashboard.py --logs ""
+python3 termux/dashboard.py --alerts
+python3 termux/dashboard.py --screen-time
+```
+
 See `termux/README.md` for the full feature list and usage.
+
+## Feature 1 (the core)
+
+Accessibility interception is documented and verified in
+[`FEATURE1.md`](FEATURE1.md) — what is captured, the JVM unit tests, and the
+end-to-end proof that it renders in the dashboard.
 
 ## Quick start (server)
 

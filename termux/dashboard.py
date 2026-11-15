@@ -34,6 +34,7 @@ Usage:
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import shutil
@@ -205,8 +206,11 @@ def sync_from_server(con, cfg, verbose=True):
         return 0
 
     for ev in ev_resp.get("events", []):
-        _id = ev.get("id") or f"e{ev.get('ts')}-{hash(json.dumps(ev, sort_keys=True))}"
+        _id = ev.get("id") or "e" + hashlib.sha1(
+            json.dumps(ev, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
         try:
+            before = con.total_changes
             con.execute(
                 "INSERT OR IGNORE INTO events(id,ts,type,package,data,child) "
                 "VALUES(?,?,?,?,?,?)",
@@ -219,12 +223,15 @@ def sync_from_server(con, cfg, verbose=True):
                     ev.get("childId", "default"),
                 ),
             )
-            added += con.total_changes
+            added += con.total_changes - before
         except Exception:
             pass
     for al in al_resp.get("alerts", []):
-        _id = al.get("id") or f"a{al.get('ts')}-{hash(json.dumps(al, sort_keys=True))}"
+        _id = al.get("id") or "a" + hashlib.sha1(
+            json.dumps(al, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
         try:
+            before = con.total_changes
             con.execute(
                 "INSERT OR IGNORE INTO alerts(id,ts,severity,reason,detail) "
                 "VALUES(?,?,?,?,?)",
@@ -233,10 +240,10 @@ def sync_from_server(con, cfg, verbose=True):
                     al.get("ts", time.time() * 1000),
                     al.get("severity", "info"),
                     al.get("reason") or al.get("type", "alert"),
-                    json.dumps(al),
+                    al.get("detail") if isinstance(al.get("detail"), str) else json.dumps(al),
                 ),
             )
-            added += con.total_changes
+            added += con.total_changes - before
         except Exception:
             pass
     con.commit()
@@ -256,6 +263,9 @@ def event_label(t):
         "screen_active": "screen activity",
         "app_usage": "app usage",
         "keylog": "typing",
+        "keystroke": "button text",
+        "screen_text": "screen text",
+        "service_connected": "monitor online",
         "notification": "notification",
         "stranger_alert": "STRANGER ALERT",
         "stranger_notification": "stranger notification",
@@ -267,6 +277,15 @@ def event_label(t):
         "vpn": "vpn",
     }
     return labels.get(t, t)
+
+
+def alert_reason(r):
+    labels = {
+        "stranger_alert": "stranger detected",
+        "stranger_notification": "stranger notification",
+        "dangerous_content": "dangerous content",
+    }
+    return labels.get(r, r)
 
 
 def pkg_name(pkg):
@@ -434,10 +453,16 @@ def show_alerts(con, limit=50):
         return
     for ts, sev, reason, detail in rows:
         color = severity_color(sev)
-        print(f"  {color('●')} [{format_ts(ts)}] {color(sev.upper())} — {reason}")
+        print(f"  {color('●')} [{format_ts(ts)}] {color(sev.upper())} — {alert_reason(reason)}")
         try:
             d = json.loads(detail or "{}")
-            snippet = d.get("data") or d.get("text") or ""
+            # Old rows wrapped the whole alert; unwrap the inner detail string.
+            if isinstance(d.get("detail"), str):
+                try:
+                    d = json.loads(d["detail"])
+                except Exception:
+                    pass
+            snippet = d.get("data") or d.get("text") or d.get("combined") or ""
             if snippet:
                 print(f"      {dim(snippet[:140])}")
         except Exception:
@@ -644,10 +669,23 @@ def main():
     ap.add_argument("--logs", metavar="QUERY", help="one-shot log search")
     ap.add_argument("--export", action="store_true", help="export logs bundle")
     ap.add_argument("--cleanup", metavar="DAYS", help="delete logs older than DAYS")
+    ap.add_argument("--configure", action="store_true",
+                    help="save server/token without the interactive menu")
+    ap.add_argument("--server", metavar="URL", help="server URL for --configure")
+    ap.add_argument("--token", metavar="TOKEN", help="parent token for --configure")
     args = ap.parse_args()
 
     con = ensure_env()
     cfg = load_config()
+
+    if args.configure:
+        if args.server:
+            cfg["server"] = args.server.rstrip("/")
+        if args.token is not None:
+            cfg["token"] = args.token
+        save_config(cfg)
+        print(green(f"  configured server={cfg.get('server')}"))
+        return
 
     if args.sync:
         sync_from_server(con, cfg)
