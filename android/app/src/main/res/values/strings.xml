@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ChildGuard</string>
+    <string name="accessibility_service_description">ChildGuard watches chat and browser text so parents can keep children safe online. It only reads on-screen text and notifications; it never modifies anything.</string>
+</resources>

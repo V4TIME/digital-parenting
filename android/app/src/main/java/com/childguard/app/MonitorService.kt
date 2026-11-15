@@ -74,8 +74,8 @@ class MonitorService : Service() {
 
         fun drain(): List<JSONObject> {
             val out = ArrayList<JSONObject>()
-            var e: JSONObject?
-            while (eventQueue.poll().also { e = it } != null) {
+            while (true) {
+                val e = eventQueue.poll() ?: break
                 out.add(e)
             }
             return out
