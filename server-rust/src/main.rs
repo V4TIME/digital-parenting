@@ -21,9 +21,10 @@
 //!   - zero web-framework dependency (small attack surface)
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Write as _;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,6 +41,9 @@ const MAX_ALERTS: usize = 500;
 const MAX_CHILDREN: usize = 2000;
 const MAX_CONNECTIONS: usize = 256;
 const SSE_HEARTBEAT_SECS: u64 = 25;
+const MAX_DUPE_KEYS: usize = 20_000;
+const TS_FUTURE_ALLOWANCE_MS: u64 = 3_600_000; // accept client clocks up to 1h ahead
+const STATE_DIR_ENV: &str = "CHILDGUARD_DATA_DIR";
 
 // ---------------------------------------------------------------------------
 // State
@@ -48,6 +52,8 @@ const SSE_HEARTBEAT_SECS: u64 = 25;
 struct Event {
     id: String,
     ts: u64,
+    #[serde(rename = "serverTs", default)]
+    server_ts: u64,
     #[serde(rename = "type")]
     type_: String,
     package: String,
@@ -79,6 +85,85 @@ struct AppState {
     alerts: VecDeque<Alert>,
     children: HashMap<String, Child>,
     sse: Vec<(String, mpsc::SyncSender<String>)>,
+    seen: HashSet<String>,
+}
+
+/// Persist the full (bounded) state as JSON. Location controlled by the
+/// CHILDGUARD_DATA_DIR env var; when unset the server runs purely in-memory.
+/// Writes atomically (tmp file + rename) so a crash can't corrupt data.
+fn persist_state(st: &AppState) {
+    let Ok(dir) = env::var(STATE_DIR_ENV) else { return };
+    if dir.is_empty() {
+        return;
+    }
+    persist_state_to(st, std::path::Path::new(&dir));
+}
+
+fn persist_state_to(st: &AppState, dir: &std::path::Path) {
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!("persist mkdir failed: {}", e);
+        return;
+    }
+    let snapshot = serde_json::json!({
+        "events": st.events,
+        "alerts": st.alerts,
+        "children": st.children.values().collect::<Vec<_>>(),
+    });
+    let tmp = dir.join("state.tmp");
+    let final_path = dir.join("state.json");
+    let res = (|| -> std::io::Result<()> {
+        let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+        serde_json::to_writer(&mut f, &snapshot).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        f.flush()?;
+        drop(f);
+        fs::rename(&tmp, &final_path)?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        eprintln!("persist failed: {}", e);
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// Load previously persisted state at startup.
+fn load_state(st: &mut AppState) {
+    let Ok(dir) = env::var(STATE_DIR_ENV) else { return };
+    if dir.is_empty() {
+        return;
+    }
+    load_state_from(st, &std::path::Path::new(&dir).join("state.json"));
+}
+
+fn load_state_from(st: &mut AppState, path: &std::path::Path) {
+    let raw = match fs::read(path) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let parsed: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if let Some(arr) = parsed.get("events").and_then(|v| v.as_array()) {
+        for ev in arr {
+            if let Ok(e) = serde_json::from_value::<Event>(ev.clone()) {
+                st.events.push_back(e);
+            }
+        }
+    }
+    if let Some(arr) = parsed.get("alerts").and_then(|v| v.as_array()) {
+        for al in arr {
+            if let Ok(a) = serde_json::from_value::<Alert>(al.clone()) {
+                st.alerts.push_back(a);
+            }
+        }
+    }
+    if let Some(arr) = parsed.get("children").and_then(|v| v.as_array()) {
+        for ch in arr {
+            if let Ok(c) = serde_json::from_value::<Child>(ch.clone()) {
+                st.children.insert(c.id.clone(), c);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +440,7 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
             registered_at: now,
         },
     );
+    persist_state(&st);
     Ok((
         200,
         serde_json::json!({ "childId": id, "token": st.token }),
@@ -409,11 +495,33 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let ts = ev.get("ts").and_then(|v| v.as_u64()).unwrap_or(now);
+        let raw_ts = ev.get("ts").and_then(|v| v.as_u64()).unwrap_or(now);
+        // Sanitize the client-supplied timestamp so a tampered/clock-skewed
+        // device cannot inject absurd future timestamps (false ordering).
+        let ts = raw_ts.min(now.saturating_add(TS_FUTURE_ALLOWANCE_MS));
+
+        // Idempotency: same (child,type,package,data,ts) is only stored once,
+        // so a retried upload can't inflate counts or duplicate alerts.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        child_id.hash(&mut hasher);
+        type_.hash(&mut hasher);
+        package.hash(&mut hasher);
+        data.hash(&mut hasher);
+        ts.hash(&mut hasher);
+        let key = hasher.finish().to_string();
+        if !st.seen.insert(key.clone()) {
+            continue; // duplicate
+        }
+        if st.seen.len() > MAX_DUPE_KEYS {
+            st.seen.clear();
+        }
+
         let id = uid("e");
         let event = Event {
             id,
             ts,
+            server_ts: now,
             type_: type_.clone(),
             package,
             data,
@@ -438,6 +546,7 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
         }
         received += 1;
     }
+    persist_state(&st);
 
     // broadcast to SSE clients
     let ev_msg = serde_json::json!({ "type": "event", "childId": child_id, "event": last_event });
@@ -493,7 +602,7 @@ fn handle_list_events(state: &Arc<Mutex<AppState>>, query: &HashMap<String, Stri
     let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).min(5000);
     let st = state.lock().unwrap();
     let events: Vec<serde_json::Value> = st.events.iter().rev().take(limit).map(|e| {
-        serde_json::json!({ "id": e.id, "ts": e.ts, "type": e.type_, "package": e.package, "data": e.data, "childId": e.child })
+        serde_json::json!({ "id": e.id, "ts": e.ts, "serverTs": e.server_ts, "type": e.type_, "package": e.package, "data": e.data, "childId": e.child })
     }).collect();
     (200, serde_json::json!({ "events": events, "total": st.events.len() }))
 }
@@ -510,7 +619,7 @@ fn handle_list_alerts(state: &Arc<Mutex<AppState>>, query: &HashMap<String, Stri
 fn handle_export(state: &Arc<Mutex<AppState>>) -> (u16, serde_json::Value) {
     let st = state.lock().unwrap();
     let events: Vec<serde_json::Value> = st.events.iter().rev().map(|e| {
-        serde_json::json!({ "id": e.id, "ts": e.ts, "type": e.type_, "package": e.package, "data": e.data, "childId": e.child })
+        serde_json::json!({ "id": e.id, "ts": e.ts, "serverTs": e.server_ts, "type": e.type_, "package": e.package, "data": e.data, "childId": e.child })
     }).collect();
     let alerts: Vec<serde_json::Value> = st.alerts.iter().rev().map(|a| {
         serde_json::json!({ "id": a.id, "ts": a.ts, "severity": a.severity, "reason": a.reason, "detail": a.detail })
@@ -589,7 +698,12 @@ fn main() {
         alerts: VecDeque::new(),
         children: HashMap::new(),
         sse: Vec::new(),
+        seen: HashSet::new(),
     }));
+    {
+        let mut st = state.lock().unwrap();
+        load_state(&mut st);
+    }
 
     let listener = TcpListener::bind(format!("{}:{}", bind, port)).expect("bind failed");
     eprintln!("ChildGuard server (rust) running on http://{}:{}", bind, port);
@@ -696,6 +810,7 @@ mod tests {
             alerts: VecDeque::new(),
             children: HashMap::new(),
             sse: Vec::new(),
+            seen: HashSet::new(),
         }))
     }
 
@@ -801,6 +916,62 @@ mod tests {
         let st = state.lock().unwrap();
         assert!(st.children.len() <= MAX_CHILDREN);
         let _ = now;
+    }
+
+    #[test]
+    fn duplicate_events_are_ignored() {
+        let state = test_state("secret");
+        let body = r#"{"childId":"cg_dup","events":[{"type":"keylog","package":"p","data":"hello","ts":5}]}"#;
+        let (code, val) = handle_events(&state, body.as_bytes()).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(val["received"].as_u64().unwrap(), 1);
+        // identical retry (e.g. failed-upload retry) must not duplicate
+        let (_code, val) = handle_events(&state, body.as_bytes()).unwrap();
+        assert_eq!(val["received"].as_u64().unwrap(), 0);
+        let st = state.lock().unwrap();
+        assert_eq!(st.events.len(), 1);
+        assert_eq!(st.alerts.len(), 0);
+    }
+
+    #[test]
+    fn future_timestamp_is_sanitized() {
+        let state = test_state("secret");
+        let now = now_ms();
+        let future = now + 10_000_000_000; // ~116 days ahead
+        let body = format!(
+            r#"{{"childId":"cg_ts","events":[{{"type":"keylog","package":"p","data":"x","ts":{}}}]}}"#,
+            future
+        );
+        let (_code, _) = handle_events(&state, body.as_bytes()).unwrap();
+        let st = state.lock().unwrap();
+        let ev = st.events.front().unwrap();
+        assert!(ev.ts <= now + TS_FUTURE_ALLOWANCE_MS);
+        assert!(ev.server_ts >= now.saturating_sub(10_000));
+    }
+
+    #[test]
+    fn persist_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cg_persist_{}", now_ms()));
+        let state = test_state("secret");
+        let body = r#"{"childId":"cg_pers","events":[{"type":"stranger_alert","package":"p","data":"hey kid","ts":7}]}"#;
+        let _ = handle_events(&state, body.as_bytes()).unwrap();
+        {
+            let st = state.lock().unwrap();
+            persist_state_to(&st, &dir);
+        }
+        drop(state);
+
+        // fresh state loading from disk should see the persisted event
+        let state2 = test_state("secret");
+        {
+            let mut st = state2.lock().unwrap();
+            load_state_from(&mut st, &dir.join("state.json"));
+            assert_eq!(st.events.len(), 1);
+            assert_eq!(st.alerts.len(), 1);
+            assert_eq!(st.events[0].data, "hey kid");
+            assert!(st.children.contains_key("cg_pers"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
