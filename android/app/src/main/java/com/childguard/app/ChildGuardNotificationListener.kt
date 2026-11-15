@@ -7,21 +7,31 @@ import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentLinkedQueue
 
+/**
+ * Feature 3 — Notification listener.
+ *
+ * Captures every notification from chat apps and flags potential stranger
+ * contact. Only notifications from known chat packages are inspected; all
+ * others are ignored (keeps the listener light and battery-friendly).
+ */
 class ChildGuardNotificationListener : NotificationListenerService() {
+
     companion object {
         private const val TAG = "ChildGuardNL"
-        var instance: ChildGuardNotificationListener? = null
+        private const val MAX_QUEUE = 200
+
+        val instance: ChildGuardNotificationListener? = null
 
         val queue = ConcurrentLinkedQueue<JSONObject>()
-        private const val MAX_QUEUE = 200
 
         private val CHAT_PACKAGES = setOf(
             "com.whatsapp", "com.whatsapp.w4b", "com.instagram.android",
             "com.snapchat.android", "com.discord", "com.telegram.messenger",
-            "com.kik.chat", "com.skype.raider", "com.pinterest",
-            "com.facebook.katana", "com.facebook.orca", "com.messenger",
-            "com.linecorp.android", "com.viber.voip",
-            "com.google.android.apps.messenger", "com.android.mms"
+            "com.kik.chat", "com.skype.raider", "com.facebook.katana",
+            "com.facebook.orca", "com.messenger", "com.linecorp.android",
+            "com.viber.voip", "com.google.android.apps.messenger",
+            "com.android.mms", "com.android.providers.downloads",
+            "com.android.browser", "com.android.chrome", "com.android.htmlviewer"
         )
 
         private val STRANGER_HINTS = listOf(
@@ -52,8 +62,8 @@ class ChildGuardNotificationListener : NotificationListenerService() {
         if (sbn == null) return
         if (!MonitorService.isMonitoring) return
 
-        val pkg = sbn.packageName
-        val extras = sbn.notification.extras
+        val pkg = sbn.packageName ?: return
+        val extras = sbn.notification?.extras ?: return
         val title = extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString() ?: ""
         val text = extras.getCharSequence(NotificationCompat.EXTRA_TEXT)?.toString() ?: ""
         val bigText = extras.getCharSequence(NotificationCompat.EXTRA_BIG_TEXT)?.toString() ?: ""
@@ -71,22 +81,26 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             put("is_chat_app", isChatApp(pkg))
         }
 
-        if (isChatApp(pkg) && isStrangerText(combined)) {
-            obj.put("stranger_alert", true)
-            obj.put("data", combined)
-            while (queue.size > MAX_QUEUE) queue.poll()
-            queue.add(obj)
+        if (isChatApp(pkg)) {
+            obj.put("chat", true)
+            if (isStrangerText(combined)) {
+                obj.put("stranger_alert", true)
+                obj.put("data", combined)
+            }
+        } else {
+            obj.put("chat", false)
         }
+
+        while (queue.size > MAX_QUEUE) queue.poll()
+        queue.add(obj)
     }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        instance = this
         Log.i(TAG, "Notification listener connected")
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
-        instance = null
     }
 }

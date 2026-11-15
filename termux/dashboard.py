@@ -343,20 +343,24 @@ def screen_time(con, days=7):
     since = int(time.time() * 1000) - days * 86400 * 1000
     rows = con.execute(
         "SELECT package, type, data, ts FROM events "
-        "WHERE ts>=? AND (type IN ('screen_active','app_usage') OR data LIKE '%duration%')",
+        "WHERE ts>=? AND type IN ('screen_active','app_usage','screen_text','screen_on')",
         (since,),
     ).fetchall()
     total = {}
     duration = {}
+    last_active = {}
+    DAY_MS = 86400 * 1000
+
     for pkg, typ, data, ts in rows:
         total[pkg] = total.get(pkg, 0) + 1
-        try:
-            d = json.loads(data or "{}")
-            ms = d.get("duration") or d.get("dur") or 0
-            if ms:
-                duration[pkg] = duration.get(pkg, 0) + int(ms)
-        except Exception:
-            pass
+        # 'data' holds the className for screen_active, not a duration. To avoid
+        # double counting the same active window, accumulate the gap between the
+        # previous session event and this one (clamped to DAY_MS).
+        prev = last_active.get(pkg)
+        if prev is not None and ts > prev:
+            gap = ts - prev
+            duration[pkg] = duration.get(pkg, 0) + min(gap, DAY_MS)
+        last_active[pkg] = ts
 
     print(banner())
     print()
