@@ -34,8 +34,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // Limits
 // ---------------------------------------------------------------------------
 const MAX_BODY: usize = 2 * 1024 * 1024; // 2 MiB
+const MAX_HEADER_REGION: usize = 64 * 1024; // 64 KiB for the header block
 const MAX_EVENTS: usize = 5000;
 const MAX_ALERTS: usize = 500;
+const MAX_CHILDREN: usize = 2000;
 const MAX_CONNECTIONS: usize = 256;
 const SSE_HEARTBEAT_SECS: u64 = 25;
 
@@ -193,10 +195,28 @@ struct Request {
     body: Vec<u8>,
 }
 
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    // bounds are safe here because haystack.len() >= needle.len()
+    for i in 0..=(haystack.len() - needle.len()) {
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<Request, u16> {
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
-    // Read until the full header block ( \r\n\r\n ) has arrived.
+    // Track where we last scanned so we don't re-scan the whole buffer on
+    // every read (avoids O(n^2) CPU on slow/large requests).
+    let mut scanned_up_to = 0usize;
     loop {
         let n = stream.read(&mut tmp).map_err(|_| 400u16)?;
         if n == 0 {
@@ -206,12 +226,19 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, u16> {
         if buf.len() > MAX_BODY + 65_536 {
             return Err(413);
         }
-        if find_subsequence(&buf, b"\r\n\r\n").is_some() {
+        // Re-scan only the new bytes, but back up 3 to catch a needle that
+        // straddles the previous/new boundary.
+        let scan_from = scanned_up_to.saturating_sub(3);
+        scanned_up_to = buf.len();
+        if find_subsequence(&buf[scan_from..], b"\r\n\r\n").is_some() {
             break;
         }
     }
 
     let split = find_subsequence(&buf, b"\r\n\r\n").ok_or(400u16)?;
+    if split > MAX_HEADER_REGION {
+        return Err(413);
+    }
     let head_bytes = &buf[..split];
     let mut body = buf[split + 4..].to_vec();
 
@@ -261,18 +288,6 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, u16> {
     })
 }
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    for i in 0..=(haystack.len() - needle.len()) {
-        if &haystack[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
@@ -288,7 +303,37 @@ fn authorized(headers: &HashMap<String, String>, token: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+/// Insert or touch a child and enforce the children-map cap (evicts the
+/// least-recently-seen entries once the bound is exceeded). Shared by the
+/// register and events handlers so neither path can grow the map unboundedly.
+fn bump_child(st: &mut AppState, id: &str, now: u64, new_child: Child) {
+    st.children
+        .entry(id.to_string())
+        .or_insert_with(|| new_child)
+        .last_seen = now;
+
+    if st.children.len() > MAX_CHILDREN {
+        let mut all: Vec<(u64, String)> = st
+            .children
+            .iter()
+            .map(|(id, c)| (c.last_seen, id.clone()))
+            .collect();
+        all.sort();
+        let victims: Vec<String> = all
+            .into_iter()
+            .take(64)
+            .map(|(_, id)| id)
+            .collect();
+        for v in victims {
+            st.children.remove(&v);
+        }
+    }
+}
+
 fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serde_json::Value), u16> {
+    if body.len() > MAX_BODY {
+        return Err(413);
+    }
     let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|_| 400u16)?;
     let name = parsed
         .get("name")
@@ -299,8 +344,10 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
     let id = uid("cg");
     let now = now_ms();
     let mut st = state.lock().unwrap();
-    st.children.insert(
-        id.clone(),
+    bump_child(
+        &mut st,
+        &id,
+        now,
         Child {
             id: id.clone(),
             name,
@@ -315,6 +362,9 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
 }
 
 fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serde_json::Value), u16> {
+    if body.len() > MAX_BODY {
+        return Err(413);
+    }
     let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|_| 400u16)?;
     let child_id = parsed
         .get("childId")
@@ -337,15 +387,17 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
     let mut st = state.lock().unwrap();
 
     // auto-register unknown child (parity with hardened Node server)
-    st.children
-        .entry(child_id.clone())
-        .or_insert_with(|| Child {
+    bump_child(
+        &mut st,
+        &child_id,
+        now,
+        Child {
             id: child_id.clone(),
             name: "Child".to_string(),
             last_seen: now,
             registered_at: now,
-        })
-        .last_seen = now;
+        },
+    );
 
     let last_event = incoming.last().cloned();
     let mut received = 0usize;
@@ -633,6 +685,7 @@ impl Drop for ConnectionGuard {
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -726,6 +779,28 @@ mod tests {
         assert_eq!(newest.data, format!("{}", MAX_EVENTS + 49));
         let oldest = st.events.front().unwrap();
         assert_eq!(oldest.data, format!("{}", 50));
+    }
+
+    #[test]
+    fn children_cap_evicts_oldest() {
+        let state = test_state("secret");
+        let now = now_ms();
+        // Insert more than the cap.
+        for i in 0..(MAX_CHILDREN + 64) {
+            let body = format!(r#"{{"name":"c{}"}}"#, i);
+            let _ = handle_register(&state, body.as_bytes()).unwrap();
+        }
+        {
+            let st = state.lock().unwrap();
+            assert!(st.children.len() <= MAX_CHILDREN);
+        }
+        // Re-register one fresh child and ensure no panic, still bounded.
+        let (code, val) = handle_register(&state, b"{\"name\":\"extra\"}").unwrap();
+        assert_eq!(code, 200);
+        assert!(val["childId"].as_str().unwrap().starts_with("cg_"));
+        let st = state.lock().unwrap();
+        assert!(st.children.len() <= MAX_CHILDREN);
+        let _ = now;
     }
 
     #[test]

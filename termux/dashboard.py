@@ -232,7 +232,7 @@ def sync_from_server(con, cfg, verbose=True):
                     _id,
                     al.get("ts", time.time() * 1000),
                     al.get("severity", "info"),
-                    al.get("type", "alert"),
+                    al.get("reason") or al.get("type", "alert"),
                     json.dumps(al),
                 ),
             )
@@ -249,8 +249,7 @@ def sync_from_server(con, cfg, verbose=True):
 # --------------------------------------------------------------------------
 # Analysis queries
 # --------------------------------------------------------------------------
-def event_label(ev):
-    t = ev[2]
+def event_label(t):
     labels = {
         "screen_on": "screen on",
         "screen_off": "screen off",
@@ -333,7 +332,7 @@ def overview(con, cfg):
     print()
     print(bold("  By event type"))
     for t, n in by_type:
-        print(f"    {event_label((t,)):18} {green(str(n))}")
+        print(f"    {event_label(t):18} {green(str(n))}")
     print()
     print(bold("  Top packages"))
     for p, n in by_pkg:
@@ -402,7 +401,7 @@ def show_logs(con, query=None, limit=50, pkg_filter=None):
     keywords = [k.lower() for k in get_cfg(con, KEYWORD_KEY, [])]
     for ts, typ, pkg, data, child in rows:
         flagged = any(k in data.lower() for k in keywords) if keywords else False
-        line = f"  [{format_ts(ts)}] {pkg_name(pkg):18} {event_label((typ,)):16}"
+        line = f"  [{format_ts(ts)}] {pkg_name(pkg):18} {event_label(typ):16}"
         if flagged:
             line = yellow(line)
         print(line)
