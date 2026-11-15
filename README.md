@@ -46,7 +46,9 @@ See `termux/README.md` for the full feature list and usage.
 
 Accessibility interception is documented and verified in
 [`FEATURE1.md`](FEATURE1.md) — what is captured, the JVM unit tests, and the
-end-to-end proof that it renders in the dashboard.
+end-to-end proof that it renders in the dashboard. Runtime proof (real
+`onAccessibilityEvent` on Android 14 + live upload to the server) and the
+on-device checklist live in [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 
 ## Quick start (server)
 

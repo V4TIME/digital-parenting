@@ -33,6 +33,12 @@ android {
 
     testOptions {
         unitTests.returnDefaultValues = true
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            // Conscrypt's JNI lib is not shipped for linux-aarch64; the tests
+            // do not use TLS, so turn the JCE provider off.
+            systemProperty 'robolectric.conscryptMode', 'OFF'
+        }
     }
 }
 
@@ -46,6 +52,12 @@ dependencies {
     implementation 'com.squareup.retrofit2:converter-gson:2.11.0'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     testImplementation 'junit:junit:4.13.2'
+    // android.jar only stubs org.json on the JVM; the retry test needs the
+    // real implementation to serialize events exactly as the app does.
+    testImplementation 'org.json:json:20231013'
+    // Robolectric 4.10.3 is the last line without the x86_64-only native
+    // runtime; it supports API 34 (Android 14) with binary resources.
+    testImplementation 'org.robolectric:robolectric:4.11.1'
     androidTestImplementation 'androidx.test.ext:junit:1.2.1'
     androidTestImplementation 'androidx.test:runner:1.6.2'
 }

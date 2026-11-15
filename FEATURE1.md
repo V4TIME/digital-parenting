@@ -22,6 +22,10 @@ Delivery: `MonitorService` drains the queue every 15 s and POSTs
 network, non-2xx) the batch is **requeued** (bounded at 1000) and retried; the
 server dedupes identical events, so retries never inflate counts.
 
+Typed text is read from the source node when available and falls back to the
+event payload (`AccessibilityEvent.text`), which is how WebViews and some chat
+fields report it — so a keystroke is not lost when no readable node exists.
+
 ## Proof in the app (JVM unit tests)
 
 `android/app/src/test/java/com/childguard/app/Feature1ExtractionTest.kt`
@@ -40,6 +44,22 @@ Run on any build machine:
 cd android && ./gradlew :app:testDebugUnitTest
 # report: app/build/reports/tests/testDebugUnitTest/index.html
 ```
+
+## Proof in the app (real Android runtime + live server)
+
+The logic tests above don't exercise `onAccessibilityEvent`. Two Robolectric
+tests do, on **Android 14 (API 34)**:
+
+- `Feature1RuntimeTest` (6 tests) builds the real service and feeds it real
+  `AccessibilityEvent`s: typing → `keylog` + `stranger_alert`, window change →
+  `screen_active`, notification fallback, `service_connected`, and
+  "nothing captured when monitoring is off".
+- `Feature1ServerE2ETest` (4 tests) then runs the real
+  `MonitorService.uploadQueuedEvents()` over HTTP against a live server:
+  every queued event reaches it, a dead network requeues instead of dropping,
+  and a resent batch doesn't inflate counts.
+
+Full details and the on-device checklist: [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 
 ## Proof in the dashboard
 
