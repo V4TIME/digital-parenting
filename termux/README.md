@@ -73,7 +73,7 @@ The Node server (`../server/index.js`) exposes:
 
 - `GET /api/events?limit=N` and `GET /api/alerts?limit=N` — used by sync
 - `POST /api/events` — used by the Android app to push events
-- `GET /health` — status probe
+- `GET /health` — unauthenticated status probe; returns no secret material
 
 Run it on any machine (including the same Termux via `pkg install nodejs`):
 

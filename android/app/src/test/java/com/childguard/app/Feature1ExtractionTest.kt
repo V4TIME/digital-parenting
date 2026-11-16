@@ -88,6 +88,34 @@ class Feature1ExtractionTest {
         assertTrue(!ChildGuardAccessibilityService.isStrangerText("the quick brown fox"))
     }
 
+    /**
+     * Documents (does not endorse) a known accuracy problem: see AUDIT.md F-12.
+     *
+     * The pattern list treats any platform name, any @mention, and any URL as
+     * a HIGH "stranger" signal, so ordinary messages raise alerts. This test
+     * pins the current behaviour so the finding stays measurable; it should be
+     * replaced with negative assertions when the patterns are tightened.
+     */
+    @Test
+    fun documentsFalsePositiveProneAlertPatterns() {
+        assertTrue(
+            "a platform name alone is alerted",
+            ChildGuardAccessibilityService.isStrangerText("we should switch to telegram")
+        )
+        assertTrue(
+            "social app mention alone is alerted",
+            ChildGuardAccessibilityService.isStrangerText("follow me on instagram")
+        )
+        assertTrue(
+            "an email @mention alone is alerted",
+            ChildGuardAccessibilityService.isStrangerText("my email is kid@example.com")
+        )
+        assertTrue(
+            "a plain URL alone is alerted",
+            ChildGuardAccessibilityService.isStrangerText("look at https://example.com/homework")
+        )
+    }
+
     @Test
     fun strangerNotificationIsDeliveredAsAlertableType() {
         assertEquals(

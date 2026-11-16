@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.childguard.app.R
 
@@ -42,7 +41,5 @@ class WebMonitorActivity : AppCompatActivity() {
         tvStatus.text = sb.toString()
 
         btnBack.setOnClickListener { finish() }
-
-        Toast.makeText(this, "Tap an app to view its traffic", Toast.LENGTH_LONG).show()
     }
 }

@@ -109,7 +109,7 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'invalid body', detail: e.message }));
         return;
       }
-      const child = state.children.get(d.childId);
+      let child = state.children.get(d.childId);
       if (!child) {
         // Auto-register unknown child ids so events are never dropped.
         child = { id: d.childId, name: 'Child', token: '', lastSeen: now(), registeredAt: now() };

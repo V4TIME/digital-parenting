@@ -42,6 +42,9 @@ const MAX_CHILDREN: usize = 2000;
 const MAX_CONNECTIONS: usize = 256;
 const SSE_HEARTBEAT_SECS: u64 = 25;
 const MAX_DUPE_KEYS: usize = 20_000;
+/// How often dirty state is flushed to disk. Writes used to happen inline on
+/// every request, which made the collector disk-bound (~8 req/s).
+const PERSIST_INTERVAL_MS: u64 = 2_000;
 const TS_FUTURE_ALLOWANCE_MS: u64 = 3_600_000; // accept client clocks up to 1h ahead
 const STATE_DIR_ENV: &str = "CHILDGUARD_DATA_DIR";
 
@@ -86,34 +89,46 @@ struct AppState {
     children: HashMap<String, Child>,
     sse: Vec<(String, mpsc::SyncSender<String>)>,
     seen: HashSet<String>,
+    /// Set by mutating handlers; the background persister flushes it.
+    dirty: bool,
 }
 
-/// Persist the full (bounded) state as JSON. Location controlled by the
-/// CHILDGUARD_DATA_DIR env var; when unset the server runs purely in-memory.
-/// Writes atomically (tmp file + rename) so a crash can't corrupt data.
-fn persist_state(st: &AppState) {
-    let Ok(dir) = env::var(STATE_DIR_ENV) else { return };
-    if dir.is_empty() {
-        return;
-    }
-    persist_state_to(st, std::path::Path::new(&dir));
+/// Lock the shared state without letting a poisoned mutex take the service
+/// down. A panic in one request must not make every later request fail.
+fn lock_state(state: &Arc<Mutex<AppState>>) -> std::sync::MutexGuard<'_, AppState> {
+    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn persist_state_to(st: &AppState, dir: &std::path::Path) {
+/// The bounded state as a JSON document.
+fn snapshot(st: &AppState) -> serde_json::Value {
+    serde_json::json!({
+        "events": st.events,
+        "alerts": st.alerts,
+        "children": st.children.values().collect::<Vec<_>>(),
+    })
+}
+
+/// Persist a snapshot as JSON, atomically (tmp file + rename) and readable by
+/// the owner only: the file holds the child's captured messages, so it must
+/// not be world-readable.
+fn write_snapshot(snapshot: &serde_json::Value, dir: &std::path::Path) {
     if let Err(e) = fs::create_dir_all(dir) {
         eprintln!("persist mkdir failed: {}", e);
         return;
     }
-    let snapshot = serde_json::json!({
-        "events": st.events,
-        "alerts": st.alerts,
-        "children": st.children.values().collect::<Vec<_>>(),
-    });
     let tmp = dir.join("state.tmp");
     let final_path = dir.join("state.json");
     let res = (|| -> std::io::Result<()> {
-        let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
-        serde_json::to_writer(&mut f, &snapshot).map_err(std::io::Error::other)?;
+        #[allow(unused_mut)]
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        serde_json::to_writer(&mut f, snapshot).map_err(std::io::Error::other)?;
         f.flush()?;
         drop(f);
         fs::rename(&tmp, &final_path)?;
@@ -123,6 +138,12 @@ fn persist_state_to(st: &AppState, dir: &std::path::Path) {
         eprintln!("persist failed: {}", e);
         let _ = fs::remove_file(&tmp);
     }
+}
+
+/// Persist the state now (used by tests and one-shot callers).
+#[allow(dead_code)] // used by the test module
+fn persist_state_to(st: &AppState, dir: &std::path::Path) {
+    write_snapshot(&snapshot(st), dir);
 }
 
 /// Load previously persisted state at startup.
@@ -415,6 +436,12 @@ fn bump_child(st: &mut AppState, id: &str, now: u64, new_child: Child) {
     }
 }
 
+/// Unauthenticated status probe. It must not reveal anything about the token:
+/// this endpoint is reachable by anyone who can see the port.
+fn handle_health() -> (u16, serde_json::Value) {
+    (200, serde_json::json!({ "ok": true, "service": "childguard", "uptime": now_ms() }))
+}
+
 fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serde_json::Value), u16> {
     if body.len() > MAX_BODY {
         return Err(413);
@@ -428,7 +455,7 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
         .unwrap_or_else(|| "Child".to_string());
     let id = uid("cg");
     let now = now_ms();
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     bump_child(
         &mut st,
         &id,
@@ -440,11 +467,8 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
             registered_at: now,
         },
     );
-    persist_state(&st);
-    Ok((
-        200,
-        serde_json::json!({ "childId": id, "token": st.token }),
-    ))
+    st.dirty = true;
+    Ok((200, serde_json::json!({ "childId": id })))
 }
 
 fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serde_json::Value), u16> {
@@ -470,7 +494,7 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
     }
 
     let now = now_ms();
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
 
     // auto-register unknown child (parity with hardened Node server)
     bump_child(
@@ -549,7 +573,7 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
         }
         received += 1;
     }
-    persist_state(&st);
+    st.dirty = true;
 
     // broadcast to SSE clients
     let ev_msg = serde_json::json!({ "type": "event", "childId": child_id, "event": last_event });
@@ -568,7 +592,7 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
 }
 
 fn handle_stats(state: &Arc<Mutex<AppState>>) -> (u16, serde_json::Value) {
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
     let mut by_type: HashMap<String, usize> = HashMap::new();
     for e in &st.events {
         *by_type.entry(e.type_.clone()).or_insert(0) += 1;
@@ -603,7 +627,7 @@ fn handle_stats(state: &Arc<Mutex<AppState>>) -> (u16, serde_json::Value) {
 
 fn handle_list_events(state: &Arc<Mutex<AppState>>, query: &HashMap<String, String>) -> (u16, serde_json::Value) {
     let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).min(5000);
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
     let events: Vec<serde_json::Value> = st.events.iter().rev().take(limit).map(|e| {
         serde_json::json!({ "id": e.id, "ts": e.ts, "serverTs": e.server_ts, "type": e.type_, "package": e.package, "data": e.data, "childId": e.child })
     }).collect();
@@ -612,7 +636,7 @@ fn handle_list_events(state: &Arc<Mutex<AppState>>, query: &HashMap<String, Stri
 
 fn handle_list_alerts(state: &Arc<Mutex<AppState>>, query: &HashMap<String, String>) -> (u16, serde_json::Value) {
     let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100).min(500);
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
     let alerts: Vec<serde_json::Value> = st.alerts.iter().rev().take(limit).map(|a| {
         serde_json::json!({ "id": a.id, "ts": a.ts, "severity": a.severity, "reason": a.reason, "detail": a.detail })
     }).collect();
@@ -620,7 +644,7 @@ fn handle_list_alerts(state: &Arc<Mutex<AppState>>, query: &HashMap<String, Stri
 }
 
 fn handle_export(state: &Arc<Mutex<AppState>>) -> (u16, serde_json::Value) {
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
     let events: Vec<serde_json::Value> = st.events.iter().rev().map(|e| {
         serde_json::json!({ "id": e.id, "ts": e.ts, "serverTs": e.server_ts, "type": e.type_, "package": e.package, "data": e.data, "childId": e.child })
     }).collect();
@@ -657,7 +681,7 @@ fn handle_sse(
     let id = uid("sse");
     let (tx, rx) = mpsc::sync_channel::<String>(64);
     {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(state);
         st.sse.push((id.clone(), tx));
     }
     let _ = conn.write_all(
@@ -683,7 +707,7 @@ fn handle_sse(
             Err(mpsc::RecvTimeoutError::Disconnected) => break 'stream,
         }
     }
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     st.sse.retain(|(sid, _)| *sid != id);
 }
 
@@ -693,7 +717,10 @@ fn handle_sse(
 fn main() {
     let port: u16 = env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(38080);
     let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let token = env::var("CHILDGUARD_TOKEN").unwrap_or_else(|_| random_hex(24));
+    let (token, token_generated) = match env::var("CHILDGUARD_TOKEN") {
+        Ok(t) if !t.is_empty() => (t, false),
+        _ => (random_hex(24), true),
+    };
 
     let state = Arc::new(Mutex::new(AppState {
         token: token.clone(),
@@ -702,15 +729,47 @@ fn main() {
         children: HashMap::new(),
         sse: Vec::new(),
         seen: HashSet::new(),
+        dirty: false,
     }));
     {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(&state);
         load_state(&mut st);
+    }
+
+    // Coalesced persistence: flush dirty state from a background thread so
+    // request handling never waits on disk I/O. Worst case on a hard kill is
+    // PERSIST_INTERVAL_MS of unflushed events.
+    if let Ok(dir) = env::var(STATE_DIR_ENV) {
+        if !dir.is_empty() {
+            let pstate = Arc::clone(&state);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(PERSIST_INTERVAL_MS));
+                let snap = {
+                    let mut st = lock_state(&pstate);
+                    if !st.dirty {
+                        continue;
+                    }
+                    st.dirty = false;
+                    snapshot(&st)
+                };
+                write_snapshot(&snap, std::path::Path::new(&dir));
+            });
+        }
     }
 
     let listener = TcpListener::bind(format!("{}:{}", bind, port)).expect("bind failed");
     eprintln!("ChildGuard server (rust) running on http://{}:{}", bind, port);
-    eprintln!("Parent token: {}", token);
+    if token_generated {
+        // Only echo a token the operator has never seen. A token they set
+        // themselves does not belong in log files / journals.
+        eprintln!("Generated parent token (set CHILDGUARD_TOKEN to choose one): {}", token);
+    } else if token.len() < 16 {
+        eprintln!(
+            "WARNING: parent token is only {} characters; use 16+ random characters \
+             (e.g. `head -c 24 /dev/urandom | base64`).",
+            token.len()
+        );
+    }
     eprintln!("Endpoints: /health /api/register /api/events /api/stats /api/alerts /api/export /api/stream");
 
     let active = Arc::new(AtomicUsize::new(0));
@@ -752,17 +811,15 @@ fn main() {
             let (path, query) = parse_query(&req.path);
 
             // auth required except health
-            let token = state.lock().unwrap().token.clone();
+            let token = lock_state(&state).token.clone();
             let needs_auth = path != "/health";
             if needs_auth && !authorized(&req.headers, &token) {
                 json_response(&mut conn, 401, &serde_json::json!({ "error": "unauthorized" }));
                 return;
             }
 
-            let result: Result<(u16, serde_json::Value), u16> = match (req.method.as_str(), path) {                ("GET", "/health") => Ok((
-                    200,
-                    serde_json::json!({ "ok": true, "token": format!("{}...", &token[..token.len().min(8)]), "uptime": now_ms() }),
-                )),
+            let result: Result<(u16, serde_json::Value), u16> = match (req.method.as_str(), path) {
+                ("GET", "/health") => Ok(handle_health()),
                 ("POST", "/api/register") => handle_register(&state, &req.body),
                 ("POST", "/api/events") => handle_events(&state, &req.body),
                 ("GET", "/api/stats") => Ok(handle_stats(&state)),
@@ -814,6 +871,7 @@ mod tests {
             children: HashMap::new(),
             sse: Vec::new(),
             seen: HashSet::new(),
+            dirty: false,
         }))
     }
 
@@ -933,6 +991,39 @@ mod tests {
         assert_eq!(st.alerts.len(), 2);
         assert_eq!(st.alerts[0].severity, "high");
         assert_eq!(st.alerts[1].severity, "medium");
+    }
+
+    #[test]
+    fn health_never_discloses_the_token() {
+        let (_code, val) = handle_health();
+        let text = val.to_string();
+        assert!(!text.contains("token"), "health must not mention the token: {}", text);
+        assert_eq!(val["ok"], true);
+    }
+
+    #[test]
+    fn persisted_state_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("cg_perm_{}", now_ms()));
+        let state = test_state("secret");
+        {
+            let st = state.lock().unwrap();
+            persist_state_to(&st, &dir);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("state.json")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "state.json must be owner-only, got {:o}", mode);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_does_not_echo_the_token() {
+        let state = test_state("secret");
+        let (_code, val) = handle_register(&state, b"{\"name\":\"Kid\"}").unwrap();
+        assert!(val["childId"].as_str().unwrap().starts_with("cg_"));
+        assert!(val.get("token").is_none(), "register must not echo the token");
     }
 
     #[test]

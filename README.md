@@ -18,8 +18,10 @@ termux/         Termux parent dashboard (terminal, no HTML): logs, screen time, 
 
 The **Rust server** (`server-rust/`) is the recommended deployment: same API as
 the Node collector, so the app and Termux dashboard work unchanged, but built as
-one static, dependency-light binary with constant-time auth and hardened input
-handling.
+one small (656 kB) dependency-light binary with constant-time auth and hardened
+input handling. The audit behind that recommendation — including measured
+throughput, memory, and the honest result that Node actually serves more writes
+per second — is in [`AUDIT.md`](AUDIT.md).
 
 ## The parent dashboard (Termux)
 
@@ -58,7 +60,7 @@ Recommended — Rust collector (single binary):
 cd server-rust
 cargo build --release
 CHILDGUARD_TOKEN=your-secret ./target/release/childguard-server
-# prints the parent token and port (default 38080)
+# listens on :38080; a token you set is never echoed to the logs
 ```
 
 Legacy Node collector (same API):
