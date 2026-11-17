@@ -45,6 +45,8 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-16 | low | Android | "Web Monitor" showed "Tap an app to view its traffic", but the list is not clickable and there is no WebView or traffic capture. | no `WebView`/`loadUrl` in the file; toast was the only interaction | **Fixed** — misleading toast removed |
 | F-17 | info | Dashboard | `config.json` stores the token; it was already owner-only. | `stat -c %a` → `600` | OK — no action |
 | F-18 | low | Docs | `ARCHITECTURE.md` described `CgLog` (`FileLogger`/`WebLogger`) as the live transport, claimed a "local-first" on-device log, and listed the reverse shell as a shipped feature. None of that was true. | `CgLog` had no call sites; `ShellConnectService` was not in the manifest | **Fixed 2026-11-17** — docs now describe the real `MonitorService` transport, no local archive, and Feature 5 as an unshipped prototype |
+| F-19 | medium | Android | The notification listener (Feature 3) still alerted on any "your mom/dad/parents", "follow me", or "you're so … nice" — the same alert-fatigue problem as F-12, on the notification path. | before: `isStrangerText("your mom said hi")` → true; `isStrangerText("follow me on instagram")` → true | **Fixed 2026-11-17** — parent mentions require secrecy context; `Feature3NotificationTest` pins both directions |
+| F-20 | low | Dashboard | There was no way to tell "network/Tailscale is down" from "the token is wrong" before syncing; both appeared only as a one-line `Sync failed` message. | `--sync` prints one error and returns | **Fixed 2026-11-17** — `--doctor` separates unauthenticated `/health` from authenticated `/api/stats` and documents exit codes 0/2/3/4/5 |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -211,7 +213,7 @@ Feature inventory after this pass:
 - **Feature 6 (transport/dashboard)** — present; real app events render in the
   dashboard (below).
 
-Daily checks (2026-11-17):
+Daily checks (first pass, 2026-11-17):
 
 ```
 server:    15/15 tests, clippy clean, node smoke OK
@@ -226,6 +228,45 @@ dashboard failure modes: wrong token → "Sync failed: HTTP Error 401:
 dashboard config.json: 600
 ```
 
+## 5c. Daily audit — 2026-11-17, second pass (repeat of the whole cycle)
+
+Re-ran the full audit, then made a second round of improvements and re-verified
+from a clean build.
+
+| Change | Why it matters | Evidence |
+|---|---|---|
+| **Scroll-aware capture** — `TYPE_VIEW_SCROLLED` added to the XML mask and the runtime `serviceInfo`, handled as a content change | long chats/web pages sometimes emit only a scroll event for newly loaded text; without subscribing, that text is invisible | packaged mask `0x187b`; `serviceRequestsScrolledContentEvents`, `scrollEventWithoutAReadableTreeIsIgnoredSafely` |
+| **Feature 3 pattern alignment** (F-19) — parent mentions require secrecy context; `follow me` and "so nice" removed | notification alerts had the same alert-fatigue flaw F-12 fixed in Feature 1 | `Feature3NotificationTest` (7) drives real `StatusBarNotification` objects: grooming → `stranger_notification` + `data`; "Mom: dinner at 7" → plain `notification`; non-chat app not flagged; 260 posts → queue 200 |
+| **`dashboard.py --doctor`** (F-20) | splits "tailnet/network down" from "token wrong" and returns exit codes usable by scripts | healthy → exit 0 with counts; wrong token → exit 3; dead server → exit 2; missing token → exit 5 |
+| **Secrecy wording broadened** — `doesn't / didn't / won't know` now alert in both Feature 1 and Feature 3 | "your dad doesn't know about this" was missed | `realGroomingSignalsStillAlert`, `broadMentionsDoNotAlert` |
+
+Features re-checked this pass:
+
+- **Feature 1** — real service → queue → upload → live collector: 7 events,
+  1 HIGH alert; dashboard renders the interception log, alert stream, and screen
+  time. Scroll subscription verified.
+- **Feature 3** — real notification objects on API 34; alert precision, chat
+  filtering, queue cap, connection flag.
+- **Feature 5** — still intentionally absent (0 shell strings in all four dex
+  files).
+- **Feature 6 / dashboard** — sync, failure modes, config permissions, doctor.
+
+Daily checks (second pass):
+
+```
+server:    15/15 tests (--offline), clippy -D warnings exit 0, node smoke OK
+android:   35 tests, 0 failures, 0 skipped (live server)
+           Extraction 13, Runtime 8, Notification 7, E2E 4, Batching 3
+APK:       7,400,089 bytes, sha256 a3b622df...ec219578
+           mask 0x187b, allowBackup=false, no WAKE_LOCK,
+           0 shell/ShellConnect/CgLog strings across all dex files
+dashboard: doctor healthy exit 0 (7 events, 1 alert, 2 children);
+           sync 8 records; HIGH alert + logs + screen time render;
+           wrong token exit 3; dead server exit 2; config 600
+server restart: 7 events / 1 alert preserved from state.json
+server log: 0 occurrences of the supplied token
+```
+
 
 ## 6. Verification log (this audit)
 
@@ -233,20 +274,22 @@ dashboard config.json: 600
 server-rust:  cargo test            → 15 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK
-android:      26 tests, 0 failures, 0 skipped (with live server)
+android:      35 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
-              test classes: Feature1Extraction 13, Feature1Runtime 6,
-              Feature1ServerE2E 4, UploadBatching 3
+              test classes: Feature1Extraction 13, Feature1Runtime 8,
+              Feature3Notification 7, Feature1ServerE2E 4, UploadBatching 3
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
-              sha256 b48fc152...f3f2f60
-dashboard:    --sync → "Sync complete: 8 new records";
+              sha256 a3b622df...ec219578
+dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
+              wrong token exit 3; dead server exit 2; missing token exit 5
+              --sync → "Sync complete: 8 new records";
               7 events / 1 alert / HIGH alert / screen time rendered
               wrong token → 401 message; dead server → connection-refused
               message (no crash); config.json mode 600
 APK:          allowBackup=false, fullBackupContent=false,
               dataExtractionRules present, WAKE_LOCK absent,
               /system/bin/sh and ShellConnect absent from all dex files,
-              event mask 0x87b, stale WebMonitor toast string absent
+              CgLog absent, event mask 0x187b, stale WebMonitor toast absent
 state.json:   -rw------- (600), 7 events / 1 alert / 2 children after E2E
 server log:   user-supplied token absent (`grep -c testsecret` → 0)
 ```

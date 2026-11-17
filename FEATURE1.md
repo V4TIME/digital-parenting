@@ -11,7 +11,7 @@ captured, delivered to the parent server, and rendered in the Termux dashboard.
 |---|---|---|
 | `keylog` | `TYPE_VIEW_TEXT_CHANGED` / `TYPE_VIEW_FOCUSED` | full text of the focused field |
 | `keystroke` | `TYPE_VIEW_CLICKED` / `TYPE_VIEW_LONG_CLICKED` | text recovered from the clicked node or its siblings |
-| `screen_text` | `TYPE_WINDOW_CONTENT_CHANGED` | visible text of the active window, uploaded only when it changed (and at most every 800 ms per package) |
+| `screen_text` | `TYPE_WINDOW_CONTENT_CHANGED` / `TYPE_VIEW_SCROLLED` | visible text of the active window, uploaded only when it changed (and at most every 800 ms per package) |
 | `screen_active` | `TYPE_WINDOW_STATE_CHANGED` | activity class (powers screen time) |
 | `stranger_alert` | pattern hit (age/photo/meet/phone/…) | the matched text |
 | `service_connected` | `onServiceConnected` | online marker |
@@ -35,6 +35,10 @@ fields report it — so a keystroke is not lost when no readable node exists.
   unbounded tree (browser DOM, recycled chat list) could otherwise stall the
   accessibility callback into an ANR. A regression test builds a lazy tree that
   would be 60^6 nodes and proves it returns in bounded time.
+- **Scroll-aware capture.** Long chats and web pages often signal new content
+  only with `TYPE_VIEW_SCROLLED`; the service subscribes and treats it as a
+  content change, so messages loaded by scrolling are not missed. The 800 ms
+  gate and the content hash stop scroll spam from re-uploading.
 - **Content-based screen dedupe.** Identical `screen_text` dumps (cursor blink,
   timers, ads) are no longer uploaded over and over: only a changed dump is
   sent. This cuts mobile-data use and makes the dashboard readable.
@@ -45,6 +49,13 @@ fields report it — so a keystroke is not lost when no readable node exists.
   raise HIGH alerts — ordinary chat contains them all day. Real signals (age /
   school / photo / secrecy / meeting / phone number) still do; tests pin both
   sides. Text is still captured either way, it just is not flagged.
+- **Notification precision (Feature 3).** The listener had its own broader
+  pattern list; it now applies the same rule (parent mentions need secrecy
+  context, `follow me` and "nice" are not signals). Tested with real
+  `StatusBarNotification` objects on API 34.
+- **Connection doctor.** `dashboard.py --doctor` reports reachability, token
+  validity, and live counts with scriptable exit codes, so a blank dashboard is
+  never ambiguous.
 
 
 ## Proof in the app (JVM unit tests)

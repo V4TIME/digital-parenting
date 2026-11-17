@@ -10,7 +10,8 @@ Two layers of proof, plus the small part that needs a real phone.
 |---|---|---|
 | `Feature1ExtractionTest` (13) | extraction/regex/retry logic on `NodeLike`, bounded view traversal, screen-dump dedupe, alert precision | none (pure JVM) |
 | `UploadBatchingTest` (3) | 600-event backlog → 250+250+100 batches, retry limit, notification `data` field | none (pure JVM) |
-| `Feature1RuntimeTest` (6) | **`onAccessibilityEvent` → `eventQueue`** on the real service | Robolectric API 34 |
+| `Feature1RuntimeTest` (8) | **`onAccessibilityEvent` → `eventQueue`** on the real service, including the scroll-event subscription | Robolectric API 34 |
+| `Feature3NotificationTest` (7) | **`onNotificationPosted` → queue**, alert precision, non-chat filtering, queue cap | Robolectric API 34 |
 | `Feature1ServerE2ETest` (4) | **`eventQueue` → `MonitorService` upload → server** | Robolectric API 34 + live server |
 
 ```bash
@@ -28,7 +29,7 @@ CHILDGUARD_SERVER=http://127.0.0.1:38080 CHILDGUARD_TOKEN=testsecret \
   gradle :app:cleanTestDebugUnitTest :app:testDebugUnitTest --tests "*Feature1ServerE2ETest"
 ```
 
-Last run: **26 tests, 0 failures** (4 E2E skipped when no server is configured).
+Last run: **35 tests, 0 failures** (4 E2E skipped when no server is configured).
 
 ### What `Feature1RuntimeTest` drives
 
@@ -125,6 +126,6 @@ running it through qemu-user:
 Independent of qemu, the real build caught a genuine bug the stub tests missed:
 `accessibility_service_config.xml` used `typeNotificationMask`, which is not a
 valid flag (it failed resource linking). It is now
-`typeNotificationStateChanged`; the packaged APK carries event mask `0x87b`
+`typeNotificationStateChanged`; the packaged APK carries event mask `0x187b`
 (click, long-click, text-changed, focused, window-state, window-content,
-notification).
+scrolled, notification).

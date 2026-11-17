@@ -24,6 +24,7 @@ on a fresh Termux with `pkg install python`.
 Usage:
     python3 dashboard.py                 # interactive terminal UI
     python3 dashboard.py --sync          # pull latest events from server, then UI
+    python3 dashboard.py --doctor        # check server + token (exit code for scripts)
     python3 dashboard.py --overview      # one-shot overview (non-interactive)
     python3 dashboard.py --screen-time   # one-shot per-app screen time
     python3 dashboard.py --logs "query"  # one-shot log search
@@ -186,6 +187,76 @@ def http_get_json(url, token, timeout=10):
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def run_doctor(cfg, timeout=5):
+    """Probe the collector the way the dashboard does and report a verdict.
+
+    Returns a process exit code so scripts can gate on it:
+      0 healthy (health + authenticated stats both work)
+      2 unreachable / bad /health
+      3 token rejected (HTTP 401)
+      4 unexpected response body
+      5 no token configured
+    """
+    url = (cfg.get("server") or DEFAULT_SERVER).rstrip("/")
+    token = cfg.get("token") or DEFAULT_TOKEN
+
+    print(bold("  Connection doctor"))
+    print(f"    server : {url}")
+    if token:
+        print(f"    token  : set ({len(token)} chars)")
+    else:
+        print("    token  : " + red("missing (run --configure --token ...)"))
+        return 5
+
+    # 1. The collector must answer without credentials: this separates
+    #    "network/Tailscale is wrong" from "the token is wrong".
+    try:
+        health = http_get_json(f"{url}/health", "", timeout=timeout)
+    except urllib.error.HTTPError as e:
+        print("    health : " + red(f"FAILED (HTTP {e.code})"))
+        return 2
+    except Exception as e:
+        print("    health : " + red(f"FAILED ({e})"))
+        print(dim("             check the URL, that the collector is running, and the tailnet"))
+        return 2
+
+    if not isinstance(health, dict) or not health.get("ok"):
+        print("    health : " + red(f"unexpected response {health!r}"))
+        return 4
+    print("    health : " + green("OK") + dim(f" (service={health.get('service', '?')})"))
+
+    # 2. Authenticated read: proves the parent token, not just reachability.
+    try:
+        stats = http_get_json(f"{url}/api/stats", token, timeout=timeout + 3)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("    auth   : " + red("FAILED (401 Unauthorized — token does not match)"))
+            return 3
+        print("    auth   : " + red(f"FAILED (HTTP {e.code})"))
+        return 2
+    except Exception as e:
+        print("    auth   : " + red(f"FAILED ({e})"))
+        return 2
+
+    if not isinstance(stats, dict):
+        print("    auth   : " + red(f"unexpected response {stats!r}"))
+        return 4
+
+    children = stats.get("children") or []
+    online = sum(1 for c in children if c.get("online"))
+    print("    auth   : " + green("OK"))
+    print(
+        "    data   : "
+        f"{stats.get('totalEvents', 0)} events, "
+        f"{stats.get('totalAlerts', 0)} alerts, "
+        f"{len(children)} child(ren), {online} online"
+    )
+    if stats.get("totalEvents", 0) == 0:
+        print(dim("             no events yet — open the app and type in a monitored app"))
+    print(green("  doctor: healthy"))
+    return 0
 
 
 def sync_from_server(con, cfg, verbose=True):
@@ -663,6 +734,8 @@ def interactive(con):
 def main():
     ap = argparse.ArgumentParser(prog="childguard-dashboard")
     ap.add_argument("--sync", action="store_true", help="sync from server before showing")
+    ap.add_argument("--doctor", action="store_true",
+                    help="check server reachability + token, exit non-zero on failure")
     ap.add_argument("--overview", action="store_true", help="one-shot overview")
     ap.add_argument("--screen-time", action="store_true", help="one-shot screen time")
     ap.add_argument("--alerts", action="store_true", help="one-shot alerts")
@@ -686,6 +759,9 @@ def main():
         save_config(cfg)
         print(green(f"  configured server={cfg.get('server')}"))
         return
+
+    if args.doctor:
+        sys.exit(run_doctor(cfg))
 
     if args.sync:
         sync_from_server(con, cfg)

@@ -37,6 +37,7 @@ chmod +x termux/dashboard.sh
 ```bash
 ./termux/dashboard.sh              # interactive menu
 ./termux/dashboard.sh --sync       # pull from server first, then menu
+./termux/dashboard.sh --doctor     # check server + token, non-zero exit on failure
 ./termux/dashboard.sh --overview   # one-shot overview
 ./termux/dashboard.sh --screen-time
 ./termux/dashboard.sh --logs "whatsapp"
@@ -51,11 +52,26 @@ Scheduled sync (optional):
 echo "*/15 * * * * python3 $PWD/termux/sync.py" | crontab -
 ```
 
+### Check the connection first
+
+`--doctor` probes the collector exactly the way the dashboard does, so a
+"dashboard shows nothing" problem can be split into network vs token:
+
+```bash
+./termux/dashboard.sh --doctor
+#   health : OK (service=childguard)     ← unauthenticated /health
+#   auth   : OK                          ← authenticated /api/stats
+#   data   : 7 events, 1 alerts, 2 child(ren), 0 online
+```
+
+Exit codes: `0` healthy, `2` unreachable/bad `/health`, `3` token rejected
+(401), `4` unexpected response, `5` no token configured.
+
 ## Configure the connection
 
 In the menu, choose **8. Configure connection**. Enter:
 
-- **server URL** — where the ChildGuard Node server runs
+- **server URL** — where the ChildGuard collector runs
   (default `http://127.0.0.1:38080`)
 - **token** — the parent token (printed when the server starts, or set via
   `CHILDGUARD_TOKEN` env)

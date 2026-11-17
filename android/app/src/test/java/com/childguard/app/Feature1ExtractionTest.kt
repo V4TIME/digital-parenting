@@ -117,6 +117,7 @@ class Feature1ExtractionTest {
     fun realGroomingSignalsStillAlert() {
         assertTrue(ChildGuardAccessibilityService.isStrangerText("hey kid, meet up after school alone"))
         assertTrue(ChildGuardAccessibilityService.isStrangerText("don't tell your mom about this"))
+        assertTrue(ChildGuardAccessibilityService.isStrangerText("your dad doesn't know about this"))
         assertTrue(ChildGuardAccessibilityService.isStrangerText("what's your school"))
         assertTrue(ChildGuardAccessibilityService.isStrangerText("call me on 123-456-7890"))
     }

@@ -36,6 +36,7 @@ Headless (scripted) usage:
 
 ```bash
 python3 termux/dashboard.py --configure --server http://<tailscale-ip>:38080 --token <token>
+python3 termux/dashboard.py --doctor      # health + token check, non-zero exit on failure
 python3 termux/dashboard.py --sync --overview
 python3 termux/dashboard.py --logs ""
 python3 termux/dashboard.py --alerts

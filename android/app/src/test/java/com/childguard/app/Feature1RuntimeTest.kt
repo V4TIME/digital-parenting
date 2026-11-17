@@ -121,6 +121,37 @@ class Feature1RuntimeTest {
     }
 
     @Test
+    fun serviceRequestsScrolledContentEvents() {
+        // Long chats/web pages sometimes signal new content only through a
+        // scroll event; if the service does not subscribe, that text is lost.
+        val m = ChildGuardAccessibilityService::class.java
+            .getDeclaredMethod("onServiceConnected")
+        m.isAccessible = true
+        m.invoke(service)
+
+        val types = ChildGuardAccessibilityService.requestedEventTypes
+        assertTrue(
+            "TYPE_VIEW_SCROLLED must be requested",
+            types and AccessibilityEvent.TYPE_VIEW_SCROLLED != 0
+        )
+        assertTrue(
+            "TYPE_WINDOW_CONTENT_CHANGED must stay requested",
+            types and AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED != 0
+        )
+    }
+
+    @Test
+    fun scrollEventWithoutAReadableTreeIsIgnoredSafely() {
+        // Robolectric has no active window here: the event must be dropped
+        // without throwing and without queueing an empty dump.
+        val ev = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_SCROLLED)
+        ev.packageName = "com.whatsapp"
+        service.onAccessibilityEvent(ev)
+
+        assertNull("no empty screen_text event", find("screen_text"))
+    }
+
+    @Test
     fun nothingIsCapturedWhenMonitoringStopped() {
         MonitorService.stop()
         service.onAccessibilityEvent(textEvent("com.whatsapp", "secret text"))

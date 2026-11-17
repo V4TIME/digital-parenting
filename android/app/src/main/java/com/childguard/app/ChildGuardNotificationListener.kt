@@ -24,7 +24,7 @@ class ChildGuardNotificationListener : NotificationListenerService() {
          * this to skip its own notification fallback, preventing the same
          * notification from being counted twice. */
         var isListenerConnected = false
-            private set
+            internal set
 
         val instance: ChildGuardNotificationListener? = null
 
@@ -40,15 +40,20 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             "com.android.browser", "com.android.chrome", "com.android.htmlviewer"
         )
 
+        // Same precision rule as Feature 1: a notification is only a stranger
+        // signal when it is conversational targeting, not merely because it
+        // mentions a parent, a platform, or a link. "Your mom said dinner at 7"
+        // and "follow me on instagram" are ordinary and must stay quiet.
         private val STRANGER_HINTS = listOf(
-            Regex("(?i)(new\\s+(friend|person|girl|boy|guy))"),
+            Regex("(?i)(new\\s+(friend|person|girl|boy|guy|account))"),
+            Regex("(?i)(hey\\s+(there|buddy|kid|child|son|daughter|young))"),
             Regex("(?i)(don'?t\\s+tell\\s+(your|your\\s+parents?|mom|dad))"),
+            Regex("(?i)(your\\s+(mom|dad|parents|mother|father)\\s+(don'?t|do\\s+not|doesn'?t|does\\s+not|didn'?t|can'?t|cannot|shouldn'?t|mustn'?t|won'?t)\\s+know)"),
             Regex("(?i)(what'?s\\s+your\\s+(age|school|address|phone|name))"),
-            Regex("(?i)(send\\s+(me|us)\\s+(a\\s+)?(photo|picture|pic))"),
+            Regex("(?i)(send\\s+(me|us)\\s+(a\\s+)?(photo|picture|nude|naked|pic))"),
             Regex("(?i)(meet\\s+up|come\\s+over|come\\s+to\\s+my\\s+place)"),
-            Regex("(?i)(you'?re\\s+(so\\s+)?(cute|hot|pretty|nice|beautiful))"),
-            Regex("(?i)(add\\s+me|add\\s+you|follow\\s+me|friend\\s+me)"),
-            Regex("(?i)(your\\s+(mom|dad|parents|mother|father))"),
+            Regex("(?i)(you'?re\\s+(so\\s+)?(cute|hot|pretty|beautiful))"),
+            Regex("(?i)(add\\s+me|add\\s+you|friend\\s+me)"),
             Regex("(?i)(\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4})"),
             Regex("(?i)(\\d{10,})")
         )

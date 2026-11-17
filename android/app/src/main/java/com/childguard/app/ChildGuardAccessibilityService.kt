@@ -67,6 +67,12 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         var isServiceRunning = false
             private set
 
+        /** Event mask last requested from the system. Kept as a plain field so
+         *  tests can assert the subscription (Robolectric's getServiceInfo()
+         *  does not retain the value set by the service). */
+        internal var requestedEventTypes = 0
+            private set
+
         val eventQueue = ConcurrentLinkedQueue<JSONObject>()
 
         // Tightened stranger patterns: only conversational signals that a
@@ -80,7 +86,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             Regex("(?i)(what'?s\\s+your\\s+(age|name|school|address|phone))"),
             Regex("(?i)(send\\s+(me|us)\\s+(a\\s+)?(photo|picture|nude|naked|pic))"),
             Regex("(?i)(meet\\s+(up|in\\s+person))"),
-            Regex("(?i)(your\\s+(mom|dad|parents)\\s+(don'?t|do\\s+not)\\s+know)"),
+            Regex("(?i)(your\\s+(mom|dad|parents)\\s+(don'?t|do\\s+not|doesn'?t|does\\s+not|didn'?t|can'?t|cannot|won'?t)\\s+know)"),
             Regex("(?i)(add\\s+me|add\\s+you|friend\\s+me)"),
             // phone-like: (xxx) xxx-xxxx or 10+ consecutive digits
             Regex("(?i)(\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4})"),
@@ -249,7 +255,8 @@ class ChildGuardAccessibilityService : AccessibilityService() {
                 AccessibilityEvent.TYPE_VIEW_CLICKED or
                 AccessibilityEvent.TYPE_VIEW_LONG_CLICKED or
                 AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
-                AccessibilityEvent.TYPE_VIEW_FOCUSED
+                AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                AccessibilityEvent.TYPE_VIEW_SCROLLED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             notificationTimeout = 250
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
@@ -257,6 +264,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
                 AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
         }
         serviceInfo = info
+        requestedEventTypes = info.eventTypes
         Log.i(TAG, "Accessibility service connected")
         enqueueEvent("service_connected", "com.childguard.app", "")
     }
@@ -333,7 +341,12 @@ class ChildGuardAccessibilityService : AccessibilityService() {
                 }
             }
 
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                // Long chats and web pages deliver older/newer content while
+                // scrolling. Some apps only emit TYPE_VIEW_SCROLLED there, so
+                // treat it as a screen-content change; the 800 ms gate and the
+                // content hash keep repeated scrolls from re-uploading.
                 if (!screenGapPassed(pkg)) return
                 val texts = collectTextFromRoot()
                 if (texts.isEmpty()) return
