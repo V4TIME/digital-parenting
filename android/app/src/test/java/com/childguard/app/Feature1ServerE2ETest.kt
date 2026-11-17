@@ -60,7 +60,8 @@ class Feature1ServerE2ETest {
         // The service dedupes repeated text/alerts/screens (correct at runtime);
         // reset that state so each test observes fresh capture.
         listOf("lastKeyByPkg", "lastAlertByKey", "lastScreenByPkg",
-               "lastActivePkg", "lastActiveTs").forEach { clearStatic(it) }
+               "lastScreenTextByPkg", "lastActivePkg", "lastActiveTs")
+            .forEach { clearStatic(it) }
     }
 
     private fun clearStatic(name: String) {

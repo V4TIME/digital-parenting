@@ -89,30 +89,77 @@ class Feature1ExtractionTest {
     }
 
     /**
-     * Documents (does not endorse) a known accuracy problem: see AUDIT.md F-12.
-     *
-     * The pattern list treats any platform name, any @mention, and any URL as
-     * a HIGH "stranger" signal, so ordinary messages raise alerts. This test
-     * pins the current behaviour so the finding stays measurable; it should be
-     * replaced with negative assertions when the patterns are tightened.
+     * Ordinary chat mentions an app, an @handle or a link all the time. Those
+     * must be captured as normal text and must NOT raise a HIGH alert: alert
+     * fatigue is how a real grooming attempt gets ignored (AUDIT.md F-12).
      */
     @Test
-    fun documentsFalsePositiveProneAlertPatterns() {
+    fun ordinaryMentionsAndLinksDoNotAlert() {
         assertTrue(
-            "a platform name alone is alerted",
-            ChildGuardAccessibilityService.isStrangerText("we should switch to telegram")
+            "a platform name alone must not alert",
+            !ChildGuardAccessibilityService.isStrangerText("we should switch to telegram")
         )
         assertTrue(
-            "social app mention alone is alerted",
-            ChildGuardAccessibilityService.isStrangerText("follow me on instagram")
+            "social app mention alone must not alert",
+            !ChildGuardAccessibilityService.isStrangerText("follow me on instagram")
         )
         assertTrue(
-            "an email @mention alone is alerted",
-            ChildGuardAccessibilityService.isStrangerText("my email is kid@example.com")
+            "an email @mention alone must not alert",
+            !ChildGuardAccessibilityService.isStrangerText("my email is kid@example.com")
         )
         assertTrue(
-            "a plain URL alone is alerted",
-            ChildGuardAccessibilityService.isStrangerText("look at https://example.com/homework")
+            "a plain URL alone must not alert",
+            !ChildGuardAccessibilityService.isStrangerText("look at https://example.com/homework")
+        )
+    }
+
+    @Test
+    fun realGroomingSignalsStillAlert() {
+        assertTrue(ChildGuardAccessibilityService.isStrangerText("hey kid, meet up after school alone"))
+        assertTrue(ChildGuardAccessibilityService.isStrangerText("don't tell your mom about this"))
+        assertTrue(ChildGuardAccessibilityService.isStrangerText("what's your school"))
+        assertTrue(ChildGuardAccessibilityService.isStrangerText("call me on 123-456-7890"))
+    }
+
+    @Test
+    fun hugeViewTreeIsTraversedWithinABudget() {
+        // Lazy tree: every node claims 60 children, each of which claims 60 more.
+        // Without a node budget this is 60^6 nodes of binder traffic.
+        var childCalls = 0
+        fun lazyNode(level: Int): NodeLike = object : NodeLike {
+            override val text: CharSequence? get() = null
+            override val contentDescription: CharSequence? get() = null
+            override val parent: NodeLike? get() = null
+            override val childCount: Int get() = 60
+            override fun child(i: Int): NodeLike {
+                childCalls++
+                return lazyNode(level + 1)
+            }
+            override fun recycle() {}
+        }
+
+        val out = StringBuilder()
+        val started = System.nanoTime()
+        ChildGuardAccessibilityService.collectNodeText(
+            lazyNode(0), out, 0, 6, 128
+        )
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+        assertTrue("traversal must stay bounded, saw $childCalls child() calls", childCalls < 1000)
+        assertTrue("traversal must be fast, took ${elapsedMs}ms", elapsedMs < 2000)
+    }
+
+    @Test
+    fun identicalScreenDumpsAreNotReuploaded() {
+        val pkg = "test.screen.${System.nanoTime()}"
+        assertTrue(ChildGuardAccessibilityService.shouldEmitScreenText(pkg, "same feed"))
+        assertTrue(
+            "the identical dump must be suppressed",
+            !ChildGuardAccessibilityService.shouldEmitScreenText(pkg, "same feed")
+        )
+        assertTrue(
+            "changed text must be uploaded",
+            ChildGuardAccessibilityService.shouldEmitScreenText(pkg, "same feed + new message")
         )
     }
 

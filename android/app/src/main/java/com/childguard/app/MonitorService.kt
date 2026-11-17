@@ -55,13 +55,44 @@ class MonitorService : Service() {
         private val retryQueue = ConcurrentLinkedQueue<JSONObject>()
         private const val MAX_RETRY = 1000
 
-        fun drainRetry(): List<JSONObject> {
-            val out = ArrayList<JSONObject>()
-            while (true) {
+        fun drainRetry(limit: Int = Int.MAX_VALUE): List<JSONObject> {
+            if (limit <= 0) return emptyList()
+            val out = ArrayList<JSONObject>(minOf(limit, 64))
+            while (out.size < limit) {
                 val e = retryQueue.poll() ?: break
                 out.add(e)
             }
             return out
+        }
+
+        /**
+         * Builds one bounded upload batch: retries first (so evidence is never
+         * starved), then the accessibility queue, then notifications, then this
+         * service's own queue. Leftovers stay queued for the next cycle, so a
+         * slow/flaky link still makes progress in small chunks instead of
+         * re-sending a huge body forever.
+         */
+        internal fun takeUploadBatch(limit: Int = MAX_BATCH): List<JSONObject> {
+            if (limit <= 0) return emptyList()
+            val merged = ArrayList<JSONObject>(minOf(limit, 64))
+            merged.addAll(drainRetry(limit))
+
+            while (merged.size < limit) {
+                val obj = ChildGuardAccessibilityService.eventQueue.poll() ?: break
+                merged.add(obj)
+            }
+            while (merged.size < limit) {
+                val obj = ChildGuardNotificationListener.queue.poll() ?: break
+                if (!obj.has("data")) {
+                    obj.put("data", obj.optString("combined"))
+                }
+                merged.add(obj)
+            }
+            while (merged.size < limit) {
+                val obj = eventQueue.poll() ?: break
+                merged.add(obj)
+            }
+            return merged
         }
 
         fun requeue(items: List<JSONObject>) {
@@ -90,7 +121,7 @@ class MonitorService : Service() {
                 put("data", data)
                 put("ts", System.currentTimeMillis())
             }
-            while (eventQueue.size > MAX_QUEUE) eventQueue.poll()
+            while (eventQueue.size >= MAX_QUEUE) eventQueue.poll()
             eventQueue.add(obj)
         }
 
@@ -187,26 +218,8 @@ class MonitorService : Service() {
     }
 
     private fun uploadQueuedEvents() {
-        val merged = ArrayList<JSONObject>()
-
-        // Retried events go first so they are not starved by new traffic.
-        merged.addAll(drainRetry())
-
-        // drain accessibility service queue
-        while (ChildGuardAccessibilityService.eventQueue.isNotEmpty() && merged.size < MAX_BATCH) {
-            ChildGuardAccessibilityService.eventQueue.poll()?.let { merged.add(it) }
-        }
-        // drain notification listener queue
-        while (ChildGuardNotificationListener.queue.isNotEmpty() && merged.size < MAX_BATCH) {
-            ChildGuardNotificationListener.queue.poll()?.let { obj ->
-                if (!obj.has("data")) {
-                    obj.put("data", obj.optString("combined"))
-                }
-                merged.add(obj)
-            }
-        }
-        // drain own queue
-        merged.addAll(drain())
+        // One bounded batch per cycle. Retries first, leftovers remain queued.
+        val merged = takeUploadBatch()
 
         if (merged.isEmpty()) return
 
@@ -216,7 +229,12 @@ class MonitorService : Service() {
         }
 
         val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
-        val serverUrl = sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: return
+        val serverUrl = sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER)
+            ?: run {
+                Log.w(TAG, "no server URL configured; keeping events for retry")
+                requeue(merged)
+                return
+            }
         val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
 
         val body = JSONObject().apply {

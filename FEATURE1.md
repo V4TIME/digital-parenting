@@ -11,32 +11,60 @@ captured, delivered to the parent server, and rendered in the Termux dashboard.
 |---|---|---|
 | `keylog` | `TYPE_VIEW_TEXT_CHANGED` / `TYPE_VIEW_FOCUSED` | full text of the focused field |
 | `keystroke` | `TYPE_VIEW_CLICKED` / `TYPE_VIEW_LONG_CLICKED` | text recovered from the clicked node or its siblings |
-| `screen_text` | `TYPE_WINDOW_CONTENT_CHANGED` (throttled 800 ms/package) | visible text of the active window |
+| `screen_text` | `TYPE_WINDOW_CONTENT_CHANGED` | visible text of the active window, uploaded only when it changed (and at most every 800 ms per package) |
 | `screen_active` | `TYPE_WINDOW_STATE_CHANGED` | activity class (powers screen time) |
 | `stranger_alert` | pattern hit (age/photo/meet/phone/…) | the matched text |
 | `service_connected` | `onServiceConnected` | online marker |
 | `notification` | fallback only, when the notification listener is NOT bound | notification text |
 
 Delivery: `MonitorService` drains the queue every 15 s and POSTs
-`{"childId": ..., "events": [...]}` to the collector. On any failure (no
-network, non-2xx) the batch is **requeued** (bounded at 1000) and retried; the
-server dedupes identical events, so retries never inflate counts.
+`{"childId": ..., "events": [...]}` to the collector in **bounded batches**
+(250 events max). On any failure (no network, non-2xx) the batch is **requeued**
+(bounded at 1000) and retried; the server dedupes identical events, so retries
+never inflate counts. Un-batched leftovers stay queued for the next cycle, so a
+slow link still makes progress instead of re-sending one huge body forever.
 
 Typed text is read from the source node when available and falls back to the
 event payload (`AccessibilityEvent.text`), which is how WebViews and some chat
 fields report it — so a keystroke is not lost when no readable node exists.
 
+## Smoothness / robustness hardening
+
+- **Bounded view traversal.** A screen dump visits at most 400 nodes and 60
+  siblings per level. Every `child()` call is a binder round-trip; an
+  unbounded tree (browser DOM, recycled chat list) could otherwise stall the
+  accessibility callback into an ANR. A regression test builds a lazy tree that
+  would be 60^6 nodes and proves it returns in bounded time.
+- **Content-based screen dedupe.** Identical `screen_text` dumps (cursor blink,
+  timers, ads) are no longer uploaded over and over: only a changed dump is
+  sent. This cuts mobile-data use and makes the dashboard readable.
+- **Bounded upload batches.** 250 events per request, retries first, leftovers
+  retained. Verified with 600 queued events: 250 + 250 + 100, no duplicates and
+  nothing lost.
+- **High-precision alerts.** Bare platform names, `@mentions` and URLs no longer
+  raise HIGH alerts — ordinary chat contains them all day. Real signals (age /
+  school / photo / secrecy / meeting / phone number) still do; tests pin both
+  sides. Text is still captured either way, it just is not flagged.
+
+
 ## Proof in the app (JVM unit tests)
 
-`android/app/src/test/java/com/childguard/app/Feature1ExtractionTest.kt`
+`android/app/src/test/java/com/childguard/app/Feature1ExtractionTest.kt` (13)
 drives the real extraction logic through a fake node tree (`NodeLike`):
 
 - send-button click recovers the child EditText's text
 - click on a sibling button walks up and finds the EditText's text
 - 1000 null children return `""` quickly (no infinite loop)
+- a 60^6 lazy view tree returns within a node/time budget
+- identical screen dumps are suppressed; changed text is uploaded
+- ordinary app mentions/@mentions/URLs do not alert; grooming signals do
 - stranger patterns match/ignore correct text
 - notification classification emits `stranger_notification`
 - failed uploads keep events for retry
+
+`UploadBatchingTest.kt` (3) proves the upload pipeline: 600 queued events are
+sent as 250 + 250 + 100 with no duplicates, retry draining honours its limit,
+and notification events get the `data` field the dashboard reads.
 
 Run on any build machine:
 

@@ -105,7 +105,7 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             obj.put("chat", false)
         }
 
-        while (queue.size > MAX_QUEUE) queue.poll()
+        while (queue.size >= MAX_QUEUE) queue.poll()
         queue.add(obj)
     }
 

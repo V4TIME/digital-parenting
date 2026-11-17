@@ -23,7 +23,13 @@ Log.addLogger(WebLogger(WebSocketLoggerBundle("ws://webserver/ws/v1/")))
 - Pattern: **Strategy + pluggable pipeline** — each logger is independent,
   cheap to add, and failures are isolated.
 
-## How we adapted it (and improved it) — `CgLog.kt`
+## How we adapted it (and improved it) — `CgLog.kt` (retired prototype)
+
+> **Status: not used.** `CgLog` was an architecture experiment. It is never
+> initialised, is no longer compiled, and lives in `docs/prototype/CgLog.kt`.
+> The app deliberately keeps **no on-device message log**; captured events are
+> held in bounded in-memory queues and uploaded by `MonitorService`. The real
+> transport is described under Feature 6 below.
 
 | Competitor | ChildGuard `CgLog` | Improvement |
 |---|---|---|
@@ -40,20 +46,28 @@ Log.addLogger(WebLogger(WebSocketLoggerBundle("ws://webserver/ws/v1/")))
 
 Design differences that make it stronger for our threat model:
 
-1. **No third-party dependencies** — every logger is built on Android/JDK APIs.
-2. **Authenticated remote push** — `WebLogger` sends to our Rust collector with
-   the parent token; the competitor's REST logger has no auth story.
-3. **Local-first** — `FileLogger` records everything on-device, so the parent
-   keeps a full audit trail even when the network path (Tailscale) is down.
-4. **Bounded everything** — file rotation caps disk usage; the collector caps
-   memory/disk as well.
+1. **No third-party dependencies** — the app and the prototype loggers use only
+   Android/JDK APIs.
+2. **Authenticated remote push** — `MonitorService` posts captured events to the
+   Rust collector with the parent bearer token; the token is never echoed by the
+   server or written to its logs.
+3. **No local message archive** — events sit in bounded queues (200 / 500 / 1000)
+   only until they are uploaded. The durable copy is the collector's
+   `state.json` (owner-only, `0600`), so a lost phone does not hand over a
+   history of the child's messages.
+4. **Bounded everything** — queues are capped, uploads are capped at 250 events
+   per batch, and the collector caps events/alerts/children as well.
 
 ## Feature mapping (what each "feature number" means)
 
 - **Feature 1** — accessibility interception (`ChildGuardAccessibilityService`)
 - **Feature 3** — notification interception (`ChildGuardNotificationListener`)
-- **Feature 5** — parent session / reverse control (`ShellConnectService`, or
-  `msfvenom` APK — see `android/verify_apk.py`)
+- **Feature 5** — parent session / reverse control: **prototype only, not
+  shipped.** See `docs/prototype/ShellConnectService.kt`. A reverse shell with no
+  authentication, no TLS and no per-session consent is a liability in a parenting
+  app, so it is not in the manifest or the APK (verified: zero shell strings in
+  every dex). Feature 1 already captures the screen; a remote shell adds risk,
+  not information.
 - **Feature 6** — transport to parent (`MonitorService` upload pipeline →
   Rust server → Termux dashboard)
 

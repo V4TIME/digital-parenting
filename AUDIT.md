@@ -38,12 +38,13 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-09 | medium | Rust server | `/api/register` echoed the parent token in its response, needlessly spreading the secret to any client/log that records responses. | response was `{"childId":"cg_...","token":"..."}` | **Fixed** — `{"childId":"..."}`; test `register_does_not_echo_the_token` |
 | F-10 | medium | Rust server | Startup printed an operator-supplied token to stderr/journal. | `Parent token: <value>` on every start | **Fixed** — only generated tokens are printed; short user tokens get a warning; verified both cases |
 | F-11 | medium | Android | `usesCleartextTraffic="true"` app-wide (token + messages in plain HTTP). | packaged manifest: `usesCleartextTraffic=true` | **Accepted risk** — traffic rides a Tailscale/WireGuard tailnet; Android network security config cannot allow-list bare IPs. Documented in the manifest and here; use TLS or keep the collector tailnet-only |
-| F-12 | medium | Android | Alert accuracy: bare platform names, any `@mention`, and any URL are treated as "stranger" signals, so ordinary messages raise HIGH alerts. | test `documentsFalsePositiveProneAlertPatterns` passes for `we should switch to telegram`, `follow me on instagram`, `kid@example.com`, `https://example.com/homework` | **Open** — needs a product decision; alert fatigue defeats the feature. Recommend requiring conversational context (who is asking, request for secrecy/meeting/contact) instead of bare tokens |
+| F-12 | medium | Android | Alert accuracy: bare platform names, any `@mention`, and any URL were treated as "stranger" signals, so ordinary messages raised HIGH alerts. | before: `documentsFalsePositiveProneAlertPatterns` matched `we should switch to telegram`, `kid@example.com`, `https://example.com/homework` | **Fixed 2026-11-17** — those bare tokens no longer alert; text is still captured. Tests: `ordinaryMentionsAndLinksDoNotAlert` + `realGroomingSignalsStillAlert` |
 | F-13 | low | Android | `QUERY_ALL_PACKAGES` is a restricted Play permission; it is used only to list installed apps in `WebMonitorActivity`. | `getInstalledApplications(...)` in `WebMonitorActivity.kt` only | **Open** — declare the use in Play Console or replace with a `<queries>` element |
 | F-14 | low | Android | `WAKE_LOCK` declared, never used. | `grep -rn WakeLock|PowerManager` → none | **Fixed** — removed; new APK permission list has no `WAKE_LOCK` |
-| F-15 | low | Android | `CgLog` (198 lines, including `FileLogger`/`WebLogger`) is never initialised, so it is dead code and a future foot-gun for logging messages to disk. | `CgLog.initialise`/`addLogger` have no call sites | **Open** — recommend deleting; no runtime behaviour today |
+| F-15 | low | Android | `CgLog` (198 lines, including `FileLogger`/`WebLogger`) is never initialised, so it is dead code and a future foot-gun for logging messages to disk. | `CgLog.initialise`/`addLogger` have no call sites | **Fixed 2026-11-17** — moved to `docs/prototype/`; no longer compiled or packaged |
 | F-16 | low | Android | "Web Monitor" showed "Tap an app to view its traffic", but the list is not clickable and there is no WebView or traffic capture. | no `WebView`/`loadUrl` in the file; toast was the only interaction | **Fixed** — misleading toast removed |
 | F-17 | info | Dashboard | `config.json` stores the token; it was already owner-only. | `stat -c %a` → `600` | OK — no action |
+| F-18 | low | Docs | `ARCHITECTURE.md` described `CgLog` (`FileLogger`/`WebLogger`) as the live transport, claimed a "local-first" on-device log, and listed the reverse shell as a shipped feature. None of that was true. | `CgLog` had no call sites; `ShellConnectService` was not in the manifest | **Fixed 2026-11-17** — docs now describe the real `MonitorService` transport, no local archive, and Feature 5 as an unshipped prototype |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -181,12 +182,50 @@ throughput, and not a reason to rewrite Kotlin or Python.
 
 1. **TLS for the collector** (F-11). Tailscale already encrypts the path; if the
    collector is ever exposed beyond the tailnet, plain HTTP is unacceptable.
-2. **Tighten alert patterns** (F-12) and add negative tests for ordinary chat.
-3. **Play policy** (F-13): declare `QUERY_ALL_PACKAGES` or scope it with
+2. **Play policy** (F-13): declare `QUERY_ALL_PACKAGES` or scope it with
    `<queries>`.
-4. **Delete `CgLog`** (F-15) so message logging cannot be enabled by accident.
-5. **On-device verification** is still required: no Android device or KVM is
+3. **On-device verification** is still required: no Android device or KVM is
    available here. Checklist in `RUNTIME_TEST.md` §3.
+
+## 5b. Daily audit — 2026-11-17: Feature 1 hardening
+
+Feature 1 already passed its correctness tests; this pass made it smoother and
+less noisy in normal use.
+
+| Change | Why it matters | Evidence |
+|---|---|---|
+| View-tree traversal capped at **400 nodes / 60 siblings per level** | every `child()` is a binder call; a big browser DOM could stall the accessibility callback into an ANR | `hugeViewTreeIsTraversedWithinABudget` (a lazy 60^6 tree returns bounded and <2 s) |
+| **Identical screen dumps suppressed** | cursor blink/timers/ads were re-uploading the same text, burning mobile data and flooding the dashboard | `identicalScreenDumpsAreNotReuploaded` |
+| **Upload batches capped at 250** across retries + both queues | leftovers stay queued, so a flaky link makes progress instead of re-sending one growing body | `batchesAreBoundedAndLoseNothing` (600 → 250+250+100, no duplicates) |
+| **Bare platform names / @mentions / URLs no longer alert** | ordinary chat contains them all day; HIGH alerts must mean something (F-12) | `ordinaryMentionsAndLinksDoNotAlert`, `realGroomingSignalsStillAlert` |
+| Queue caps fixed from `>` to `>=` | queues now stay exactly at their limit instead of limit+1 | code + tests |
+| `CgLog` and the Feature 5 prototype moved out of the build | F-15/F-18; the APK no longer carries dead logging code or shell code | source tree + dex checks |
+
+Feature inventory after this pass:
+
+- **Feature 1 (accessibility)** — present and verified end-to-end.
+- **Feature 3 (notifications)** — present (`ChildGuardNotificationListener`),
+  unit/runtime paths covered; queue now exactly capped.
+- **Feature 5 (reverse session)** — intentionally **not shipped**; prototype in
+  `docs/prototype/`.
+- **Feature 6 (transport/dashboard)** — present; real app events render in the
+  dashboard (below).
+
+Daily checks (2026-11-17):
+
+```
+server:    15/15 tests, clippy clean, node smoke OK
+android:   26 tests, 0 failures, 0 skipped (live server)
+app→server keylog 4, screen_active 2, stranger_alert 1
+dashboard: Sync complete: 8 new records; 7 events / 1 alert / HIGH alert +
+           interception log + screen time all render
+server restart from state.json: 7 events / 1 alert preserved
+dashboard failure modes: wrong token → "Sync failed: HTTP Error 401:
+           Unauthorized"; dead server → "Sync failed: <urlopen error [Errno 111]
+           Connection refused>" (no crash, menu still usable)
+dashboard config.json: 600
+```
+
 
 ## 6. Verification log (this audit)
 
@@ -194,10 +233,16 @@ throughput, and not a reason to rewrite Kotlin or Python.
 server-rust:  cargo test            → 15 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK
-android:      20 tests, 0 failures, 0 skipped (with live server)
+android:      26 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
-android:      assembleDebug → app-debug.apk 7,400,089 bytes
-              sha256 71047d43...36961e45
+              test classes: Feature1Extraction 13, Feature1Runtime 6,
+              Feature1ServerE2E 4, UploadBatching 3
+android:      assembleDebug → app-debug.apk 7,400,089 bytes,
+              sha256 b48fc152...f3f2f60
+dashboard:    --sync → "Sync complete: 8 new records";
+              7 events / 1 alert / HIGH alert / screen time rendered
+              wrong token → 401 message; dead server → connection-refused
+              message (no crash); config.json mode 600
 APK:          allowBackup=false, fullBackupContent=false,
               dataExtractionRules present, WAKE_LOCK absent,
               /system/bin/sh and ShellConnect absent from all dex files,

@@ -56,6 +56,12 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         private const val SCREEN_MIN_GAP_MS = 800L
         private const val SCREEN_ACTIVE_GAP_MS = 1_000L
         private const val MAX_DEDUPE_KEYS = 64
+        /** Hard ceiling on accessibility nodes touched per screen dump. A huge
+         *  browser/chat view tree must never turn an event callback into an
+         *  ANR: every child() call is a binder round-trip. */
+        private const val MAX_TREE_NODES = 400
+        /** How many siblings are inspected around a clicked node. */
+        private const val MAX_CHILDREN_SCAN = 60
 
         var instance: ChildGuardAccessibilityService? = null
         var isServiceRunning = false
@@ -63,7 +69,10 @@ class ChildGuardAccessibilityService : AccessibilityService() {
 
         val eventQueue = ConcurrentLinkedQueue<JSONObject>()
 
-        // Tightened stranger patterns (phone-like numbers only, not any 3 digits).
+        // Tightened stranger patterns: only conversational signals that a
+        // stranger is targeting the child. Bare platform names, @mentions and
+        // URLs are deliberately NOT alerts — ordinary chat contains them all
+        // day and alert fatigue hides the real hits (AUDIT.md F-12).
         private val STRANGER_PATTERNS = listOf(
             Regex("(?i)(hey\\s+(there|buddy|kid|child|son|daughter|young))"),
             Regex("(?i)(you\\s+are\\s+(so\\s+)?(cute|young|handsome))"),
@@ -72,13 +81,10 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             Regex("(?i)(send\\s+(me|us)\\s+(a\\s+)?(photo|picture|nude|naked|pic))"),
             Regex("(?i)(meet\\s+(up|in\\s+person))"),
             Regex("(?i)(your\\s+(mom|dad|parents)\\s+(don'?t|do\\s+not)\\s+know)"),
-            Regex("(?i)(whatsapp|telegram|discord|snapchat|signal|kik|skype|tiktok|instagram)"),
-            Regex("(?i)(add\\s+me|add\\s+you|follow\\s+me|friend\\s+me)"),
+            Regex("(?i)(add\\s+me|add\\s+you|friend\\s+me)"),
             // phone-like: (xxx) xxx-xxxx or 10+ consecutive digits
             Regex("(?i)(\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4})"),
             Regex("(?i)(\\d{10,})"),
-            Regex("(?i)(@\\w{2,30})"),
-            Regex("(?i)(http[s]?://)"),
         )
 
         // Keyed throttle state. All are bounded; when they exceed the cap the
@@ -86,6 +92,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         private val lastAlertByKey = HashMap<String, Long>()
         private val lastScreenByPkg = HashMap<String, Long>()
         private val lastKeyByPkg = HashMap<String, String>()
+        private val lastScreenTextByPkg = HashMap<String, Int>()
         private var lastActivePkg = ""
         private var lastActiveTs = 0L
 
@@ -107,12 +114,25 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         }
 
         /** Prevents repeated full-screen dumps from flooding the logs. */
-        private fun shouldEmitScreen(pkg: String): Boolean {
+        private fun screenGapPassed(pkg: String): Boolean {
             val now = System.currentTimeMillis()
             val last = lastScreenByPkg[pkg]
             if (last != null && now - last < SCREEN_MIN_GAP_MS) return false
             lastScreenByPkg[pkg] = now
             if (lastScreenByPkg.size > MAX_DEDUPE_KEYS) lastScreenByPkg.clear()
+            return true
+        }
+
+        /**
+         * A screen can change continuously (cursor blink, timers, ads). Sending
+         * the identical dump again only costs battery and makes the dashboard
+         * unreadable, so only a changed dump is uploaded.
+         */
+        internal fun shouldEmitScreenText(pkg: String, text: String): Boolean {
+            val hash = text.hashCode()
+            if (lastScreenTextByPkg[pkg] == hash) return false
+            lastScreenTextByPkg[pkg] = hash
+            if (lastScreenTextByPkg.size > MAX_DEDUPE_KEYS) lastScreenTextByPkg.clear()
             return true
         }
 
@@ -160,7 +180,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             var depth = 0
             while (parent != null && depth < 3) {
                 var childIndex = 0
-                while (childIndex < parent.childCount) {
+                while (childIndex < parent.childCount && childIndex < MAX_CHILDREN_SCAN) {
                     val child = parent.child(childIndex)
                     childIndex++ // always advance; null child cannot stall this loop
                     if (child == null) continue
@@ -187,9 +207,11 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             out: StringBuilder,
             depth: Int,
             maxDepth: Int,
-            maxChars: Int
+            maxChars: Int,
+            budget: IntArray = intArrayOf(MAX_TREE_NODES)
         ) {
-            if (depth > maxDepth || out.length >= maxChars) return
+            if (depth > maxDepth || out.length >= maxChars || budget[0] <= 0) return
+            budget[0]--
             node.text?.toString()?.trim()?.let {
                 if (it.length > 1 && out.length < maxChars) {
                     if (out.isNotEmpty()) out.append(' ')
@@ -202,10 +224,12 @@ class ChildGuardAccessibilityService : AccessibilityService() {
                     out.append(it.take(maxChars - out.length))
                 }
             }
-            for (i in 0 until node.childCount) {
+            val count = if (depth >= maxDepth) 0 else minOf(node.childCount, MAX_CHILDREN_SCAN)
+            for (i in 0 until count) {
+                if (budget[0] <= 0 || out.length >= maxChars) return
                 val child = node.child(i) ?: continue
                 try {
-                    collectNodeText(child, out, depth + 1, maxDepth, maxChars)
+                    collectNodeText(child, out, depth + 1, maxDepth, maxChars, budget)
                 } finally {
                     child.recycle()
                 }
@@ -310,14 +334,14 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             }
 
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                if (!shouldEmitScreen(pkg)) return
+                if (!screenGapPassed(pkg)) return
                 val texts = collectTextFromRoot()
-                if (texts.isNotEmpty()) {
-                    val joined = texts.joinToString(" ").take(MAX_TEXT_LEN)
-                    enqueueEvent("screen_text", pkg, joined)
-                    if (isStrangerText(joined) && shouldFireAlert(pkg, joined)) {
-                        enqueueEvent("stranger_alert", pkg, joined)
-                    }
+                if (texts.isEmpty()) return
+                val joined = texts.joinToString(" ").take(MAX_TEXT_LEN)
+                if (!shouldEmitScreenText(pkg, joined)) return
+                enqueueEvent("screen_text", pkg, joined)
+                if (isStrangerText(joined) && shouldFireAlert(pkg, joined)) {
+                    enqueueEvent("stranger_alert", pkg, joined)
                 }
             }
         }
@@ -340,7 +364,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             put("data", data)
             put("ts", System.currentTimeMillis())
         }
-        while (eventQueue.size > MAX_QUEUE) eventQueue.poll()
+        while (eventQueue.size >= MAX_QUEUE) eventQueue.poll()
         eventQueue.add(obj)
     }
 
