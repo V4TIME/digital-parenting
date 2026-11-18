@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="ChildGuard — digital parenting without the cloud">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070b18"/>
+      <stop offset="0.55" stop-color="#101736"/>
+      <stop offset="1" stop-color="#1a2350"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5eead4"/>
+      <stop offset="0.55" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0.15" cy="0.1" r="0.55">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0.9" cy="0.85" r="0.5">
+      <stop offset="0" stop-color="#6366f1" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#94a3b8" stroke-opacity="0.06" stroke-width="1"/>
+    </pattern>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="320" fill="url(#bg)"/>
+  <rect width="1200" height="320" fill="url(#grid)"/>
+  <rect width="1200" height="320" fill="url(#glowA)"/>
+  <rect width="1200" height="320" fill="url(#glowB)"/>
+
+  <!-- decorative network -->
+  <g stroke="#7dd3fc" stroke-opacity="0.30" stroke-width="1.5" fill="none">
+    <path d="M905 92 L1010 60 L1115 104 L1076 205 L960 238 L888 168 Z"/>
+    <path d="M905 92 L1076 205 M1010 60 L960 238 M1115 104 L888 168"/>
+  </g>
+  <g fill="#7dd3fc" fill-opacity="0.55">
+    <circle cx="905" cy="92" r="4"/>
+    <circle cx="1010" cy="60" r="4"/>
+    <circle cx="1115" cy="104" r="4"/>
+    <circle cx="1076" cy="205" r="4"/>
+    <circle cx="960" cy="238" r="4"/>
+    <circle cx="888" cy="168" r="4"/>
+  </g>
+  <circle cx="1010" cy="148" r="54" fill="none" stroke="#a5b4fc" stroke-opacity="0.18" stroke-width="1.5"/>
+  <circle cx="1010" cy="148" r="82" fill="none" stroke="#a5b4fc" stroke-opacity="0.10" stroke-width="1.5"/>
+
+  <!-- shield emblem -->
+  <g transform="translate(74 62)">
+    <path d="M78 4 L150 34 V104 C150 158 120 190 78 208 C36 190 6 158 6 104 V34 Z"
+          fill="#0b122a" stroke="url(#shield)" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M78 18 L136 43 V104 C136 148 112 175 78 191 C44 175 20 148 20 104 V43 Z"
+          fill="url(#shield)" fill-opacity="0.10"/>
+    <path d="M47 108 L69 130 L112 82" fill="none" stroke="url(#shield)" stroke-width="10"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="78" cy="108" r="66" fill="#38bdf8" fill-opacity="0.10" filter="url(#soft)"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="300" y="166"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="78" font-weight="800" letter-spacing="-1.5" fill="#f8fafc">ChildGuard</text>
+  <text x="302" y="212"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="24" font-weight="500" fill="#9fb0d0">Digital parenting without the cloud.</text>
+
+  <!-- footer chips -->
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+     font-size="14" font-weight="600">
+    <g transform="translate(302 244)">
+      <rect width="168" height="30" rx="15" fill="#0f1c3a" stroke="#38bdf8" stroke-opacity="0.35"/>
+      <text x="84" y="20" text-anchor="middle" fill="#7dd3fc">Android · Kotlin</text>
+    </g>
+    <g transform="translate(484 244)">
+      <rect width="188" height="30" rx="15" fill="#0f1c3a" stroke="#a78bfa" stroke-opacity="0.35"/>
+      <text x="94" y="20" text-anchor="middle" fill="#c4b5fd">Rust · 656 kB</text>
+    </g>
+    <g transform="translate(686 244)">
+      <rect width="196" height="30" rx="15" fill="#0f1c3a" stroke="#2dd4bf" stroke-opacity="0.35"/>
+      <text x="98" y="20" text-anchor="middle" fill="#5eead4">Termux · no HTML</text>
+    </g>
+    <g transform="translate(896 244)">
+      <rect width="176" height="30" rx="15" fill="#0f1c3a" stroke="#fbbf24" stroke-opacity="0.35"/>
+      <text x="88" y="20" text-anchor="middle" fill="#fcd34d">tailnet-only</text>
+    </g>
+  </g>
+</svg>

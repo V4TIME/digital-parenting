@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="230" height="32" viewBox="0 0 230 32" role="img" aria-label="android: target SDK 35">
+  <defs>
+    <clipPath id="r"><rect width="230" height="32" rx="6"/></clipPath>
+  </defs>
+  <g clip-path="url(#r)" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" text-anchor="middle">
+    <rect width="100" height="32" fill="#1f2633"/>
+    <rect x="100" width="130" height="32" fill="#2ea44f"/>
+    <rect x="100" width="1" height="32" fill="#0b0f16" fill-opacity="0.35"/>
+    <text x="50" y="21" fill="#c9d3e3">android</text>
+    <text x="165" y="21" fill="#ffffff">target SDK 35</text>
+  </g>
+</svg>
