@@ -28,6 +28,17 @@ class DashboardActivity : AppCompatActivity() {
         tvStatus.text = if (monitoring) "Monitoring: ON" else "Monitoring: OFF"
         btnToggle.text = if (monitoring) "Stop Monitoring" else "Start Monitoring"
 
+        // The first-run flow goes SetupActivity -> DashboardActivity, which
+        // used to show "Monitoring: ON" (the preference default) without ever
+        // starting MonitorService; only MainActivity did that. Start it here
+        // too, so the label always matches reality. START is idempotent.
+        if (monitoring) {
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, MonitorService::class.java).setAction("childguard.START")
+            )
+        }
+
         btnToggle.setOnClickListener {
             val next = !sp.getBoolean(ChildGuardApp.KEY_MONITORING, true)
             sp.edit().putBoolean(ChildGuardApp.KEY_MONITORING, next).apply()

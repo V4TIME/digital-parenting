@@ -73,11 +73,13 @@ In the menu, choose **8. Configure connection**. Enter:
 
 - **server URL** — where the ChildGuard collector runs
   (default `http://127.0.0.1:38080`)
-- **token** — the parent token (printed when the server starts, or set via
-  `CHILDGUARD_TOKEN` env)
+- **token** — the parent token you set via `CHILDGUARD_TOKEN` (the collector
+  never prints a user-supplied token; it only prints one it generated)
 
 The token is sent as `Authorization: Bearer <token>`; without it the server
-returns 401. You can also pre-write the config file:
+returns 401. `--configure --server URL --token VALUE` does the same
+non-interactively and normalizes a trailing slash. The config is written
+atomically `0600` inside a `0700` directory. You can also pre-write it:
 
 ```json
 { "server": "http://192.168.1.50:38080", "token": "your_token_here" }
@@ -104,7 +106,10 @@ termux/
 ├── dashboard.py      # the full dashboard (stdlib-only, no pip deps)
 ├── dashboard.sh      # launcher
 ├── sync.py           # cron-friendly server → local DB sync
+├── test_dashboard.py # stdlib regression tests (permissions, export, screen time)
 └── README.md
 ```
 
-Data lives in `~/.childguard/` (`logs.db`, `config.json`, `exports/`).
+Data lives in `~/.childguard/` (`logs.db`, `config.json`, `exports/`). The
+directory is `0700`; the database, config, export tarball, and archive members
+are `0600`. An interrupted export removes its temporary JSONL files.

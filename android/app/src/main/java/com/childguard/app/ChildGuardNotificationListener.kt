@@ -10,15 +10,23 @@ import java.util.concurrent.ConcurrentLinkedQueue
 /**
  * Feature 3 — Notification listener.
  *
- * Captures every notification from chat apps and flags potential stranger
- * contact. Only notifications from known chat packages are inspected; all
- * others are ignored (keeps the listener light and battery-friendly).
+ * Captures notifications from chat apps only and flags potential stranger
+ * contact. Non-chat packages (banking, 2FA, games, system) are ignored before
+ * any text is read: a parenting tool must not harvest one-time passcodes or
+ * payment alerts. Repeated identical posts from the same app inside a short
+ * window are collapsed, because messaging apps re-post the same notification
+ * when an avatar or timestamp changes.
  */
 class ChildGuardNotificationListener : NotificationListenerService() {
 
     companion object {
         private const val TAG = "ChildGuardNL"
         private const val MAX_QUEUE = 200
+
+        /** How long an identical (package, text) notification is treated as a
+         * re-post of the previous one. */
+        private const val DEDUPE_WINDOW_MS = 30_000L
+        private const val DEDUPE_MAX_KEYS = 256
 
         /** True while the system notification listener is bound. Feature 1 uses
          * this to skip its own notification fallback, preventing the same
@@ -30,14 +38,18 @@ class ChildGuardNotificationListener : NotificationListenerService() {
 
         val queue = ConcurrentLinkedQueue<JSONObject>()
 
+        // Messaging apps only. Browsers, download providers, and generic
+        // "messenger" package names used to be here, which pulled unrelated
+        // notification text into the child's record. Screen text from a
+        // browser is Feature 1's job, not the notification listener's.
         private val CHAT_PACKAGES = setOf(
             "com.whatsapp", "com.whatsapp.w4b", "com.instagram.android",
             "com.snapchat.android", "com.discord", "com.telegram.messenger",
-            "com.kik.chat", "com.skype.raider", "com.facebook.katana",
-            "com.facebook.orca", "com.messenger", "com.linecorp.android",
-            "com.viber.voip", "com.google.android.apps.messenger",
-            "com.android.mms", "com.android.providers.downloads",
-            "com.android.browser", "com.android.chrome", "com.android.htmlviewer"
+            "org.telegram.plus", "com.kik.chat", "com.skype.raider",
+            "com.facebook.katana", "com.facebook.orca", "com.messenger",
+            "com.linecorp.android", "com.viber.voip",
+            "com.google.android.apps.messaging", "com.google.android.apps.messenger",
+            "com.android.mms", "org.thoughtcrime.securesms"
         )
 
         // Same precision rule as Feature 1: a notification is only a stranger
@@ -64,13 +76,30 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             return STRANGER_HINTS.any { it.containsMatchIn(t) }
         }
 
+        /** Exact package or a sub-package, never a prefix spoof such as
+         *  `com.whatsapp_clone`. */
         fun isChatApp(pkg: String): Boolean =
-            CHAT_PACKAGES.any { pkg.equals(it, true) || pkg.startsWith(it) }
+            CHAT_PACKAGES.any { pkg.equals(it, true) || pkg.startsWith("$it.", ignoreCase = true) }
 
         /** Single source of truth for the event type of a notification, so a
          * stranger hit is always delivered as an alertable type. */
         fun classify(combined: String): String =
             if (isStrangerText(combined)) "stranger_notification" else "notification"
+    }
+
+    // Instance-scoped so a rebuilt listener starts with a clean window and
+    // tests cannot leak dedupe state into each other.
+    private val recentlyPosted = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun isDuplicate(pkg: String, combined: String): Boolean {
+        val now = System.currentTimeMillis()
+        val key = "$pkg\u0000$combined"
+        val previous = recentlyPosted.put(key, now)
+        if (recentlyPosted.size > DEDUPE_MAX_KEYS) {
+            recentlyPosted.entries.removeIf { now - it.value > DEDUPE_WINDOW_MS }
+            if (recentlyPosted.size > DEDUPE_MAX_KEYS) recentlyPosted.clear()
+        }
+        return previous != null && now - previous < DEDUPE_WINDOW_MS
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -79,6 +108,10 @@ class ChildGuardNotificationListener : NotificationListenerService() {
         if (!MonitorService.isMonitoring) return
 
         val pkg = sbn.packageName ?: return
+        // Privacy boundary: stop before reading title/text for anything that
+        // is not a known chat app.
+        if (!isChatApp(pkg)) return
+
         val extras = sbn.notification?.extras ?: return
         val title = extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString() ?: ""
         val text = extras.getCharSequence(NotificationCompat.EXTRA_TEXT)?.toString() ?: ""
@@ -86,6 +119,7 @@ class ChildGuardNotificationListener : NotificationListenerService() {
 
         val combined = listOf(title, text, bigText).filter { it.isNotBlank() }.joinToString(" | ")
         if (combined.length < 3) return
+        if (isDuplicate(pkg, combined)) return
 
         val obj = JSONObject().apply {
             put("type", "notification")
@@ -94,20 +128,16 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             put("text", text)
             put("combined", combined)
             put("ts", System.currentTimeMillis())
-            put("is_chat_app", isChatApp(pkg))
+            put("is_chat_app", true)
+            put("chat", true)
         }
 
-        if (isChatApp(pkg)) {
-            obj.put("chat", true)
-            if (isStrangerText(combined)) {
-                obj.put("stranger_alert", true)
-                obj.put("data", combined)
-                // Emit a distinct type so the collector raises an alert;
-                // otherwise the flag would sit invisible in the event stream.
-                obj.put("type", classify(combined))
-            }
-        } else {
-            obj.put("chat", false)
+        if (isStrangerText(combined)) {
+            obj.put("stranger_alert", true)
+            obj.put("data", combined)
+            // Emit a distinct type so the collector raises an alert;
+            // otherwise the flag would sit invisible in the event stream.
+            obj.put("type", classify(combined))
         }
 
         while (queue.size >= MAX_QUEUE) queue.poll()

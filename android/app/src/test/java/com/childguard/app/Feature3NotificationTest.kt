@@ -98,13 +98,48 @@ class Feature3NotificationTest {
     }
 
     @Test
-    fun nonChatAppIsCapturedButNotFlagged() {
+    fun nonChatAppIsIgnoredEntirely() {
+        // Privacy boundary: games, banking, and 2FA must not be read or queued.
         listener.onNotificationPosted(sbn("com.example.game", "Level up", "you reached level 3"))
+        listener.onNotificationPosted(sbn("com.bank.app", "Code", "Your OTP is 123456"))
+        listener.onNotificationPosted(sbn("com.android.chrome", "Tab", "news headline"))
+
+        assertNull(
+            "non-chat notifications must not be queued at all",
+            ChildGuardNotificationListener.queue.peek()
+        )
+    }
+
+    @Test
+    fun repeatedIdenticalChatPostIsQueuedOnce() {
+        // Messaging apps re-post on avatar/timestamp changes. One message must
+        // not become two events (or two alerts).
+        for (i in 1..5) {
+            listener.onNotificationPosted(sbn("com.whatsapp", "New friend", "hey kid meet up"))
+        }
 
         val ev = onlyQueued()
-        assertEquals("notification", ev.optString("type"))
-        assertFalse("not a chat app", ev.optBoolean("chat"))
-        assertFalse(ev.has("stranger_alert"))
+        assertEquals("stranger_notification", ev.optString("type"))
+        assertTrue(ev.optBoolean("stranger_alert"))
+    }
+
+    @Test
+    fun distinctChatPostsAreStillQueued() {
+        listener.onNotificationPosted(sbn("com.whatsapp", "Mom", "dinner at 7"))
+        listener.onNotificationPosted(sbn("com.whatsapp", "Mom", "dinner at 8"))
+
+        assertEquals(2, ChildGuardNotificationListener.queue.size)
+    }
+
+    @Test
+    fun chatPackageMatchingDoesNotAcceptPrefixSpoofs() {
+        assertTrue(ChildGuardNotificationListener.isChatApp("com.whatsapp"))
+        assertTrue(ChildGuardNotificationListener.isChatApp("com.whatsapp.w4b"))
+        assertFalse(
+            "a lookalike package must not be treated as WhatsApp",
+            ChildGuardNotificationListener.isChatApp("com.whatsapp_clone")
+        )
+        assertFalse(ChildGuardNotificationListener.isChatApp("com.example.chat"))
     }
 
     @Test

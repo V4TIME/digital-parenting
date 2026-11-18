@@ -6,7 +6,7 @@
   running on hardware and a network you control.
   <br><br>
   <img src="docs/badges/android.svg" alt="Android: target SDK 35" height="28">
-  <img src="docs/badges/tests.svg" alt="35 tests passing" height="28">
+  <img src="docs/badges/tests.svg" alt="52 tests passing" height="28">
   <img src="docs/badges/rust.svg" alt="Rust collector, 656 kB" height="28">
   <img src="docs/badges/network.svg" alt="Tailnet only" height="28">
   <!-- Local SVG assets only: no external badge services. Keep tests.svg in sync. -->
@@ -25,9 +25,10 @@
 > [!NOTE]
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
-> dashboard. The full suite is **35 tests, 0 failures, 0 skipped** against a
-> live collector. Remaining work is a run on a physical phone; no Android
-> device or KVM is available in the build environment.
+> dashboard. The full suite is **52 tests, 0 failures, 0 skipped** against a
+> live collector, plus 17 collector tests and 7 dashboard regression tests.
+> Remaining work is a run on a physical phone; no Android device or KVM is
+> available in the build environment.
 
 ## Why ChildGuard
 
@@ -42,9 +43,9 @@
 
 | # | Feature | What actually ships | Status |
 |---|---|---|---|
-| **1** | Accessibility capture | Typed text, keystrokes, visible screen text, active app, scroll-loaded content; stranger-signal detection with alert dedupe | ✅ **Verified end to end** (13 unit + 8 runtime + 4 E2E tests) |
-| **3** | Notification listener | Chat notifications, stranger classification, non-chat filtering, bounded queue, fallback when unbound | ✅ **Verified** (7 runtime tests) |
-| **6** | Transport + dashboard | Bounded batches, retries for flaky mobile data, sync, logs, screen time, alerts, export, doctor | ✅ **Verified** |
+| **1** | Accessibility capture | Typed text, keystrokes, visible screen text, active app, scroll-loaded content; stranger-signal detection with alert dedupe; password/PIN fields excluded | ✅ **Verified end to end** (15 unit + 11 runtime + 4 E2E tests) |
+| **3** | Notification listener | Chat notifications only, stranger classification, 30 s re-post dedupe, bounded queue, chat-only fallback | ✅ **Verified** (10 runtime tests) |
+| **6** | Transport + dashboard | Bounded batches, retries for flaky mobile data, crash-safe service lifecycle, sync, logs, screen time, alerts, export, doctor | ✅ **Verified** (4 lifecycle + 6 transport tests) |
 | **5** | Reverse session | Not shipped. A no-auth, no-TLS shell is a liability in a parenting app; the prototype lives in [`docs/prototype/`](docs/prototype/README.md) | ⛔ **Prototype only** |
 
 ## Architecture
@@ -176,13 +177,14 @@ method are in [`AUDIT.md`](AUDIT.md) and [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 
 | Layer | Command | Last result |
 |---|---|---|
-| Collector unit tests | `cargo test --offline` | **15 passed, 0 failed** |
+| Collector unit tests | `cargo test --offline` | **17 passed, 0 failed** |
+| Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **7 passed, 0 failed** |
 | Collector lints | `cargo clippy --offline -- -D warnings` | **exit 0** |
 | Legacy collector | `node server/smoke_test.js` | **SMOKE OK** |
-| Android suite | `gradle :app:testDebugUnitTest --offline` | **35 tests, 0 failures, 0 skipped** |
+| Android suite | `gradle :app:testDebugUnitTest --offline` | **52 tests, 0 failures, 0 skipped** |
 | Connection | `python3 termux/dashboard.py --doctor` | **exit 0**, live counts |
 | Failure modes | wrong token / dead collector | **exit 3 / exit 2**, no crash |
-| APK | `:app:assembleDebug` | 7,400,089 bytes, `sha256 a3b622df…` |
+| APK | `:app:assembleDebug` | 7,400,089 bytes, `sha256 157e1ce5…392894d9` |
 
 The Android suite includes real `onAccessibilityEvent` and
 `onNotificationPosted` calls under Robolectric API 34, plus four tests that
@@ -196,8 +198,11 @@ upload to a live collector and read the result back.
 - Every upload cycle takes at most **250 events**, retries first, and leaves
   the remainder queued for the next cycle — a slow link makes progress instead
   of re-sending one growing request.
-- A failed request requeues the batch; the collector dedupes event IDs, so
-  retries cannot inflate counts.
+- Transient failures (timeouts, 401/403/404, 429, 5xx) requeue with
+  exponential backoff (30 s → 5 min); a healthy link returns to 15 s.
+- A `400`/`422` batch is split in half until the poison event is isolated, and
+  a `413` shrinks the batch instead of discarding evidence.
+- The collector dedupes event IDs, so retries cannot inflate counts.
 - Screen dumps are deduped by content and rate-limited to one per 800 ms per
   package; identical dumps are not uploaded again.
 - View traversal is capped at 400 nodes and 60 siblings per level; every
@@ -210,9 +215,14 @@ upload to a live collector and read the result back.
 - **Token handling** — bearer auth with constant-time comparison; the collector
   never returns the token, never logs a user-supplied token, and warns on short
   secrets. `/health` is unauthenticated and contains no secret material.
-- **At rest** — collector state is `0600`; the Termux dashboard config and
-  database are `0600`/`0700`; Android backup is disabled (`allowBackup=false`,
-  `dataExtractionRules` excludes all domains).
+- **Data minimization** — the notification listener reads **chat apps only**
+  (banking, 2FA, games and system notifications are never inspected), repeated
+  posts are collapsed for 30 s, and accessibility capture skips
+  `isPassword` fields so PINs and credentials are never uploaded.
+- **At rest** — collector state and its data directory are `0600`/`0700` and
+  fsynced before rename; dashboard config, database, export tarballs, archive
+  members, and temp export files are `0600`; Android backup is disabled
+  (`allowBackup=false`, `dataExtractionRules` excludes all domains).
 - **Bounded input** — 2 MiB request bodies, 64 KiB headers, capped events,
   alerts, children, and dedupe keys; future-dated device timestamps are clamped.
 - **Cleartext is a known trade-off** — plain HTTP is used because the collector
@@ -225,7 +235,7 @@ upload to a live collector and read the result back.
 ```text
 android/            Kotlin app: accessibility + notification services, uploader, UI
   app/src/main/     production sources and manifest
-  app/src/test/     35 JVM/Robolectric tests
+  app/src/test/     52 JVM/Robolectric tests
 server-rust/        recommended collector: one binary, hardened, no web UI
 server/             legacy Node collector with the same API
 termux/             terminal dashboard + sync helper (Python standard library)

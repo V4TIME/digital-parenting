@@ -38,6 +38,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -76,6 +77,19 @@ def cyan(t): return c(C.CYAN, t)
 def magenta(t): return c(C.MAGENTA, t)
 def bold(t): return c(C.BOLD, t)
 def dim(t): return c(C.DIM, t)
+
+# C0/C1 controls plus bidi overrides. Captured chat text is attacker-controlled:
+# an ESC or OSC sequence could clear the screen, spoof a prompt, or set the
+# clipboard (OSC 52). Never print it raw to a terminal.
+_UNSAFE_TERMINAL = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def safe_text(value, limit=None):
+    """Strip terminal control characters from untrusted text."""
+    text = _UNSAFE_TERMINAL.sub(" ", str(value if value is not None else ""))
+    if limit is not None:
+        text = text[:limit]
+    return text
 
 # --------------------------------------------------------------------------
 # Paths / environment
@@ -155,8 +169,37 @@ def load_config():
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    """Write config.json atomically and owner-only.
+
+    The config holds the parent token. Opening the final path with `open()`
+    would briefly create it with the process umask (0644 on a default umask),
+    so write to a 0600 temp file, fsync it, then rename it into place. A
+    reader never sees a partial file, and a crash cannot leave a token in a
+    world-readable inode.
+    """
+    os.makedirs(BASE, exist_ok=True)
+    try:
+        os.chmod(BASE, 0o700)
+    except OSError:
+        pass
+
+    tmp = f"{CONFIG_PATH}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)  # defeat a permissive umask explicitly
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
+        os.chmod(CONFIG_PATH, 0o600)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def get_cfg(con, key, default=""):
@@ -347,7 +390,7 @@ def event_label(t):
         "clipboard": "clipboard",
         "vpn": "vpn",
     }
-    return labels.get(t, t)
+    return safe_text(labels.get(t, t))
 
 
 def alert_reason(r):
@@ -356,15 +399,16 @@ def alert_reason(r):
         "stranger_notification": "stranger notification",
         "dangerous_content": "dangerous content",
     }
-    return labels.get(r, r)
+    return safe_text(labels.get(r, r))
 
 
 def pkg_name(pkg):
+    pkg = safe_text(pkg)
     if not pkg:
         return "(system)"
     short = pkg.split(".")
     if len(short) >= 2:
-        return short[-1].capitalize()
+        return safe_text(short[-1].capitalize())
     return pkg
 
 
@@ -383,7 +427,7 @@ def format_ts(ts, fmt="%Y-%m-%d %H:%M:%S"):
     try:
         return dt.datetime.fromtimestamp(ts / 1000).strftime(fmt)
     except Exception:
-        return str(ts)
+        return safe_text(ts)
 
 
 # --------------------------------------------------------------------------
@@ -412,7 +456,7 @@ def overview(con, cfg):
 
     print(banner())
     print()
-    print(bold("  Server") + f"  {cfg.get('server', DEFAULT_SERVER)}")
+    print(bold("  Server") + f"  {safe_text(cfg.get('server', DEFAULT_SERVER))}")
     print(bold("  Last sync") + f"  {format_ts(get_cfg(con, LAST_SYNC_KEY, 0) * 1000) if get_cfg(con, LAST_SYNC_KEY, 0) else dim('never')}")
     print()
     print(bold("  Totals"))
@@ -429,28 +473,44 @@ def overview(con, cfg):
         print(f"    {pkg_name(p):20} {green(str(n))}")
 
 
+# Longest gap that can still be treated as continuous use of one app. Screen
+# events arrive at least every ~800 ms while a screen changes; a gap longer
+# than this is idle/off time, not screen time.
+MAX_SESSION_GAP_MS = 5 * 60 * 1000
+
+
+def compute_screen_durations(rows, max_gap_ms=MAX_SESSION_GAP_MS):
+    """Return (event_count, attributed_ms) per package.
+
+    `data` is the class name for screen_active, not a duration, so duration is
+    inferred from the gap between consecutive events of the same package. The
+    old code clamped that gap to one day, which turned an overnight idle gap
+    into up to 24 h of screen time for whichever app was opened next.
+    """
+    total = {}
+    duration = {}
+    last_active = {}
+    # Sync stores the server's newest-first response, so rows are not
+    # necessarily chronological. Sorting here keeps the helper correct even
+    # when a caller forgets ORDER BY (Timsort is linear on sorted input).
+    for pkg, _typ, _data, ts in sorted(rows, key=lambda r: r[3]):
+        total[pkg] = total.get(pkg, 0) + 1
+        prev = last_active.get(pkg)
+        if prev is not None and ts > prev:
+            duration[pkg] = duration.get(pkg, 0) + min(ts - prev, max_gap_ms)
+        last_active[pkg] = ts
+    return total, duration
+
+
 def screen_time(con, days=7):
     since = int(time.time() * 1000) - days * 86400 * 1000
     rows = con.execute(
         "SELECT package, type, data, ts FROM events "
-        "WHERE ts>=? AND type IN ('screen_active','app_usage','screen_text','screen_on')",
+        "WHERE ts>=? AND type IN ('screen_active','app_usage','screen_text','screen_on') "
+        "ORDER BY ts",
         (since,),
     ).fetchall()
-    total = {}
-    duration = {}
-    last_active = {}
-    DAY_MS = 86400 * 1000
-
-    for pkg, typ, data, ts in rows:
-        total[pkg] = total.get(pkg, 0) + 1
-        # 'data' holds the className for screen_active, not a duration. To avoid
-        # double counting the same active window, accumulate the gap between the
-        # previous session event and this one (clamped to DAY_MS).
-        prev = last_active.get(pkg)
-        if prev is not None and ts > prev:
-            gap = ts - prev
-            duration[pkg] = duration.get(pkg, 0) + min(gap, DAY_MS)
-        last_active[pkg] = ts
+    total, duration = compute_screen_durations(rows)
 
     print(banner())
     print()
@@ -499,9 +559,9 @@ def show_logs(con, query=None, limit=50, pkg_filter=None):
         if flagged:
             line = yellow(line)
         print(line)
-        snippet = (data or "").replace("\n", " ")
-        if len(snippet) > 120:
-            snippet = snippet[:120] + "…"
+        snippet = safe_text(data or "", 120)
+        if len(data or "") > 120:
+            snippet += "…"
         if snippet:
             flag = yellow(" ⚠ flagged") if flagged else ""
             print(f"      {dim(snippet)}{flag}")
@@ -524,7 +584,7 @@ def show_alerts(con, limit=50):
         return
     for ts, sev, reason, detail in rows:
         color = severity_color(sev)
-        print(f"  {color('●')} [{format_ts(ts)}] {color(sev.upper())} — {alert_reason(reason)}")
+        print(f"  {color('●')} [{format_ts(ts)}] {color(safe_text(sev).upper())} — {alert_reason(reason)}")
         try:
             d = json.loads(detail or "{}")
             # Old rows wrapped the whole alert; unwrap the inner detail string.
@@ -535,10 +595,10 @@ def show_alerts(con, limit=50):
                     pass
             snippet = d.get("data") or d.get("text") or d.get("combined") or ""
             if snippet:
-                print(f"      {dim(snippet[:140])}")
+                print(f"      {dim(safe_text(snippet, 140))}")
         except Exception:
             if detail:
-                print(f"      {dim(detail[:140])}")
+                print(f"      {dim(safe_text(detail, 140))}")
 
 
 def manage_keywords(con):
@@ -563,9 +623,11 @@ def manage_keywords(con):
     elif choice == "r":
         try:
             idx = int(input("  number to remove: ").strip()) - 1
+            if idx < 0 or idx >= len(words):
+                raise ValueError("out of range")
             removed = words.pop(idx)
             set_cfg(con, KEYWORD_KEY, words)
-            print(green(f"  removed '{removed}'"))
+            print(green(f"  removed '{safe_text(removed)}'"))
         except Exception:
             print(red("  bad index"))
     else:
@@ -612,12 +674,41 @@ def configure(con):
     print(bold("  Configure connection"))
     cur = input(f"  server URL [{cfg.get('server', DEFAULT_SERVER)}]: ").strip()
     if cur:
-        cfg["server"] = cur
-    tok = input(f"  token [{cfg.get('token', '')}]: ").strip()
+        cfg["server"] = cur.rstrip("/")
+    current_token = cfg.get("token", "")
+    # Never echo the secret into the terminal or its scrollback. Enter keeps it.
+    hint = f"set, {len(current_token)} chars" if current_token else "unset"
+    tok = input(f"  token [{hint}]: ").strip()
     if tok:
         cfg["token"] = tok
     save_config(cfg)
     print(green("  saved. run --sync to pull data."))
+
+
+def open_private(path, mode="w", encoding="utf-8"):
+    """Open a file owner-only from the first byte.
+
+    `open(path, "w")` inherits the umask, so an export temp file or tarball
+    is world-readable until a later chmod — and stays that way if the process
+    is interrupted. O_CREAT with 0600 plus fchmod closes that window.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, mode, encoding=encoding)
+
+
+def _owner_only_tarinfo(ti):
+    """Archive members must not extract as 0644 for another local user."""
+    ti.mode = 0o600
+    ti.uid = 0
+    ti.gid = 0
+    ti.uname = ""
+    ti.gname = ""
+    return ti
 
 
 def do_export(con):
@@ -625,40 +716,49 @@ def do_export(con):
     path = os.path.join(EXPORT_DIR, f"childguard_logs_{stamp}.tar.gz")
     tmp_json = os.path.join(EXPORT_DIR, f"events_{stamp}.jsonl")
     tmp_alerts = os.path.join(EXPORT_DIR, f"alerts_{stamp}.jsonl")
+    cfg_snapshot = os.path.join(EXPORT_DIR, f"config_snapshot_{stamp}.json")
 
-    with open(tmp_json, "w", encoding="utf-8") as f:
-        for row in con.execute("SELECT ts,type,package,data,child FROM events ORDER BY ts"):
-            f.write(json.dumps({"ts": row[0], "type": row[1], "package": row[2],
-                                "data": row[3], "child": row[4]}) + "\n")
-    with open(tmp_alerts, "w", encoding="utf-8") as f:
-        for row in con.execute("SELECT ts,severity,reason,detail FROM alerts ORDER BY ts"):
-            f.write(json.dumps({"ts": row[0], "severity": row[1],
-                                "reason": row[2], "detail": row[3]}) + "\n")
-
-    with tarfile.open(path, "w:gz") as tar:
-        tar.add(tmp_json, arcname="events.jsonl")
-        tar.add(tmp_alerts, arcname="alerts.jsonl")
-        cfg_snapshot = os.path.join(EXPORT_DIR, "config_snapshot.json")
-        with open(cfg_snapshot, "w", encoding="utf-8") as f:
+    try:
+        with open_private(tmp_json, "w") as f:
+            for row in con.execute("SELECT ts,type,package,data,child FROM events ORDER BY ts"):
+                f.write(json.dumps({"ts": row[0], "type": row[1], "package": row[2],
+                                    "data": row[3], "child": row[4]}) + "\n")
+        with open_private(tmp_alerts, "w") as f:
+            for row in con.execute("SELECT ts,severity,reason,detail FROM alerts ORDER BY ts"):
+                f.write(json.dumps({"ts": row[0], "severity": row[1],
+                                    "reason": row[2], "detail": row[3]}) + "\n")
+        with open_private(cfg_snapshot, "w") as f:
             json.dump({
                 "keywords": get_cfg(con, KEYWORD_KEY, []),
                 "blocklist": get_cfg(con, BLOCKLIST_KEY, []),
                 "configured_server": load_config().get("server"),
             }, f, indent=2)
-        try:
-            os.chmod(cfg_snapshot, 0o600)
-        except Exception:
-            pass
-        tar.add(cfg_snapshot, arcname="config_snapshot.json")
 
-    os.remove(tmp_json)
-    os.remove(tmp_alerts)
-    os.remove(cfg_snapshot)
-    try:
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
-    print(green(f"  exported → {path}"))
+        # Create the tarball itself 0600; chmod-after-write left a readable
+        # window and a crashed export left the file readable forever.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as raw:
+            try:
+                os.fchmod(raw.fileno(), 0o600)
+            except OSError:
+                pass
+            with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+                tar.add(tmp_json, arcname="events.jsonl", filter=_owner_only_tarinfo)
+                tar.add(tmp_alerts, arcname="alerts.jsonl", filter=_owner_only_tarinfo)
+                tar.add(cfg_snapshot, arcname="config_snapshot.json",
+                        filter=_owner_only_tarinfo)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        print(green(f"  exported → {path}"))
+    finally:
+        # Interrupted exports must not leave captured messages behind.
+        for leftover in (tmp_json, tmp_alerts, cfg_snapshot):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
 
 
 def do_cleanup(con, days):
@@ -741,7 +841,8 @@ def main():
     ap.add_argument("--alerts", action="store_true", help="one-shot alerts")
     ap.add_argument("--logs", metavar="QUERY", help="one-shot log search")
     ap.add_argument("--export", action="store_true", help="export logs bundle")
-    ap.add_argument("--cleanup", metavar="DAYS", help="delete logs older than DAYS")
+    ap.add_argument("--cleanup", metavar="DAYS", type=int,
+                    help="delete logs older than DAYS")
     ap.add_argument("--configure", action="store_true",
                     help="save server/token without the interactive menu")
     ap.add_argument("--server", metavar="URL", help="server URL for --configure")
@@ -757,7 +858,7 @@ def main():
         if args.token is not None:
             cfg["token"] = args.token
         save_config(cfg)
-        print(green(f"  configured server={cfg.get('server')}"))
+        print(green(f"  configured server={safe_text(cfg.get('server'))}"))
         return
 
     if args.doctor:
@@ -782,6 +883,13 @@ def main():
         return
     if args.cleanup:
         do_cleanup(con, args.cleanup)
+        return
+
+    # `--sync` is documented as "sync, then show the UI". When there is no
+    # terminal (cron, a pipe, CI), opening the menu only raises EOFError.
+    if not sys.stdin.isatty():
+        print(dim("  non-interactive terminal: use --overview, --logs, --alerts, "
+                  "--screen-time, or --export (sync.py for scheduled pulls)."))
         return
 
     interactive(con)

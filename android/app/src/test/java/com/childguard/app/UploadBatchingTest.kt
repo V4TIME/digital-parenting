@@ -2,6 +2,7 @@ package com.childguard.app
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -52,6 +53,48 @@ class UploadBatchingTest {
         assertEquals(3, MonitorService.drainRetry(3).size)
         assertEquals(2, MonitorService.drainRetry(10).size)
         assertTrue(MonitorService.drainRetry(10).isEmpty())
+    }
+
+    @Test
+    fun onlyPayloadAndMediaErrorsArePermanent() {
+        // Retrying these can never help; the caller must split or drop.
+        assertTrue(MonitorService.isPermanentFailure(400))
+        assertTrue(MonitorService.isPermanentFailure(415))
+        assertTrue(MonitorService.isPermanentFailure(422))
+
+        // Auth, routing, throttling and server faults are recoverable.
+        assertFalse(MonitorService.isPermanentFailure(401))
+        assertFalse(MonitorService.isPermanentFailure(403))
+        assertFalse(MonitorService.isPermanentFailure(404))
+        assertFalse(MonitorService.isPermanentFailure(408))
+        assertFalse(MonitorService.isPermanentFailure(429))
+        assertFalse(MonitorService.isPermanentFailure(500))
+        assertFalse(MonitorService.isPermanentFailure(503))
+    }
+
+    @Test
+    fun transientFailuresBackOffAndCap() {
+        assertEquals(15_000L, MonitorService.backoffDelayMs(0))
+        assertEquals(30_000L, MonitorService.backoffDelayMs(1))
+        assertEquals(60_000L, MonitorService.backoffDelayMs(2))
+        assertEquals(120_000L, MonitorService.backoffDelayMs(3))
+        assertEquals(240_000L, MonitorService.backoffDelayMs(4))
+        assertEquals(MonitorService.MAX_BACKOFF_MS, MonitorService.backoffDelayMs(5))
+        assertEquals(
+            "backoff must stay capped for a long outage",
+            MonitorService.MAX_BACKOFF_MS,
+            MonitorService.backoffDelayMs(50)
+        )
+    }
+
+    @Test
+    fun serverUrlIsTrimmedAndHasNoDoubleSlash() {
+        assertEquals(
+            "http://100.64.0.2:38080",
+            MonitorService.normalizeServerUrl("  http://100.64.0.2:38080///  ")
+        )
+        assertEquals("https://cg.example", MonitorService.normalizeServerUrl("https://cg.example/"))
+        assertEquals("", MonitorService.normalizeServerUrl("   "))
     }
 
     @Test

@@ -9,3 +9,10 @@ exports/
 build/
 local.properties
 target/
+
+# Build artifacts and payloads must never be committed. A previous revision
+# tracked a Metasploit APK at the repo root (see AUDIT.md F-21); keep root
+# APKs out of git and never track a handler rc file.
+/*.apk
+/handler.rc
+*.rc.tmp

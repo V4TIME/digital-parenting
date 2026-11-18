@@ -34,6 +34,8 @@ class Feature1RuntimeTest {
         service = Robolectric.buildService(ChildGuardAccessibilityService::class.java)
             .create().get()
         ChildGuardAccessibilityService.eventQueue.clear()
+        // Make the fallback tests deterministic regardless of test order.
+        ChildGuardNotificationListener.isListenerConnected = false
     }
 
     private fun events(): List<JSONObject> =
@@ -80,6 +82,18 @@ class Feature1RuntimeTest {
     }
 
     @Test
+    fun passwordEventIsNotRecorded() {
+        val ev = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED)
+        ev.packageName = "com.whatsapp"
+        ev.text.add("PIN 987654")
+        ev.isPassword = true
+        service.onAccessibilityEvent(ev)
+
+        assertNull("password/PIN text must never be captured", find("keylog"))
+        assertNull(find("stranger_alert"))
+    }
+
+    @Test
     fun windowChangeIsQueuedForScreenTime() {
         val ev = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)
         ev.packageName = "com.android.chrome"
@@ -105,6 +119,33 @@ class Feature1RuntimeTest {
         val n = find("notification")
         assertNotNull("notification fallback must queue", n)
         assertEquals("New message from unknown number", n!!.optString("data"))
+    }
+
+    @Test
+    fun notificationFallbackIgnoresNonChatPackages() {
+        // The fallback must enforce the same privacy boundary as Feature 3.
+        val ev = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED)
+        ev.packageName = "com.bank.app"
+        ev.text.add("Your one-time code is 654321")
+        service.onAccessibilityEvent(ev)
+
+        assertNull("banking/2FA notifications must never be captured", find("notification"))
+    }
+
+    @Test
+    fun notificationFallbackDedupesRepeatedPost() {
+        repeat(3) {
+            val ev = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED)
+            ev.packageName = "com.whatsapp"
+            ev.text.add("Fallback duplicate probe 7842")
+            service.onAccessibilityEvent(ev)
+        }
+
+        assertEquals(
+            "a re-posted notification must produce one event, not three",
+            1,
+            events().count { it.optString("type") == "notification" }
+        )
     }
 
     @Test

@@ -16,11 +16,13 @@ class Feature1ExtractionTest {
     /** In-memory stand-in for a view node. */
     private class FakeNode(
         var nodeText: String? = null,
-        var desc: String? = null
+        var desc: String? = null,
+        password: Boolean = false
     ) : NodeLike {
         val children = ArrayList<NodeLike?>()
         override val text: CharSequence? get() = nodeText
         override val contentDescription: CharSequence? get() = desc
+        override val isPassword: Boolean = password
         override var parent: NodeLike? = null
         override val childCount: Int get() = children.size
         override fun child(i: Int): NodeLike? = if (i in children.indices) children[i] else null
@@ -49,6 +51,30 @@ class Feature1ExtractionTest {
         row.children.add(button)
         button.parent = row
         assertEquals("meet me after school", ChildGuardAccessibilityService.extractTextNear(button))
+    }
+
+    @Test
+    fun passwordFieldsAreNeverExtracted() {
+        val pin = FakeNode("1234", password = true)
+        val button = FakeNode()
+        button.children.add(pin)
+        assertEquals("", ChildGuardAccessibilityService.extractTextNear(button))
+
+        val out = StringBuilder()
+        ChildGuardAccessibilityService.collectNodeText(pin, out, 0, 6, 128)
+        assertEquals("password text must never enter a screen dump", "", out.toString())
+    }
+
+    @Test
+    fun ancestorWalkSkipsSiblingPasswordField() {
+        val pin = FakeNode("hunter2", password = true)
+        val button = FakeNode()
+        val row = FakeNode()
+        row.children.add(pin)
+        row.children.add(button)
+        button.parent = row
+
+        assertEquals("", ChildGuardAccessibilityService.extractTextNear(button))
     }
 
     @Test

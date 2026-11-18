@@ -43,10 +43,33 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-14 | low | Android | `WAKE_LOCK` declared, never used. | `grep -rn WakeLock|PowerManager` → none | **Fixed** — removed; new APK permission list has no `WAKE_LOCK` |
 | F-15 | low | Android | `CgLog` (198 lines, including `FileLogger`/`WebLogger`) is never initialised, so it is dead code and a future foot-gun for logging messages to disk. | `CgLog.initialise`/`addLogger` have no call sites | **Fixed 2026-11-17** — moved to `docs/prototype/`; no longer compiled or packaged |
 | F-16 | low | Android | "Web Monitor" showed "Tap an app to view its traffic", but the list is not clickable and there is no WebView or traffic capture. | no `WebView`/`loadUrl` in the file; toast was the only interaction | **Fixed** — misleading toast removed |
-| F-17 | info | Dashboard | `config.json` stores the token; it was already owner-only. | `stat -c %a` → `600` | OK — no action |
+| F-17 | info | Dashboard | `config.json` stores the token; an existing file was owner-only. | `stat -c %a` → `600` | **Superseded by F-22** — the check only saw a config that a later `ensure_env()` had already chmodded; the *first* creation was `0644` |
 | F-18 | low | Docs | `ARCHITECTURE.md` described `CgLog` (`FileLogger`/`WebLogger`) as the live transport, claimed a "local-first" on-device log, and listed the reverse shell as a shipped feature. None of that was true. | `CgLog` had no call sites; `ShellConnectService` was not in the manifest | **Fixed 2026-11-17** — docs now describe the real `MonitorService` transport, no local archive, and Feature 5 as an unshipped prototype |
 | F-19 | medium | Android | The notification listener (Feature 3) still alerted on any "your mom/dad/parents", "follow me", or "you're so … nice" — the same alert-fatigue problem as F-12, on the notification path. | before: `isStrangerText("your mom said hi")` → true; `isStrangerText("follow me on instagram")` → true | **Fixed 2026-11-17** — parent mentions require secrecy context; `Feature3NotificationTest` pins both directions |
 | F-20 | low | Dashboard | There was no way to tell "network/Tailscale is down" from "the token is wrong" before syncing; both appeared only as a one-line `Sync failed` message. | `--sync` prints one error and returns | **Fixed 2026-11-17** — `--doctor` separates unauthenticated `/health` from authenticated `/api/stats` and documents exit codes 0/2/3/4/5 |
+| F-21 | critical | Repo | A tracked `childguard_wellbeing.apk` was a **Metasploit Android payload**, and root `handler.rc` was a matching reverse-TCP handler. | `aapt2 dump badging` → `package com.metasploit.stage`, `minSdkVersion 10`, `SEND_SMS`/location/phone permissions; `strings classes.dex` → `Lcom/metasploit/stage/MainActivity;`; `handler.rc` → `android/meterpreter/reverse_tcp`, `LHOST 0.0.0.0`, `LPORT 4444`; both in `git ls-files` | **Fixed at HEAD 2026-11-18** — `git rm` both, `.gitignore` now blocks root `*.apk` and `handler.rc`; RUNTIME_TEST no longer suggests `msfconsole`. **History still contains the blobs**: rewrite history before making this repo public |
+| F-22 | high | Dashboard | First `--configure` created `config.json` (which holds the parent token) with mode `0644`. | `(umask 022; ... --configure ...); stat -c %a config.json` → `644` | **Fixed 2026-11-18** — 0600 temp file + `fchmod` + `fsync` + `rename`; fresh-home test asserts `0600` under umask 022 |
+| F-23 | high | Android | The notification listener captured **every** package despite a docstring claiming chat-only, and the Feature 1 fallback did the same. Banking alerts and 2FA codes were uploaded. | old `onNotificationPosted` had no package guard; `Feature3NotificationTest` asserted `com.example.game` was captured | **Fixed 2026-11-18** — chat allowlist checked before reading extras; fallback uses the same allowlist; prefix spoofs (`com.whatsapp_clone`) rejected. Tests: `nonChatAppIsIgnoredEntirely`, `notificationFallbackIgnoresNonChatPackages`, `chatPackageMatchingDoesNotAcceptPrefixSpoofs` |
+| F-24 | medium | Android | A re-posted chat notification produced another event, so one message could become several rows/alerts. | old listener queued on every `onNotificationPosted` | **Fixed 2026-11-18** — 30 s `(package, text)` dedupe in both the listener and the fallback; tests `repeatedIdenticalChatPostIsQueuedOnce`, `notificationFallbackDedupesRepeatedPost` |
+| F-25 | medium | Android | Uploads retried **permanent** 4xx forever at a fixed 15 s, and a saved trailing slash produced `//api/events`. | old branch: `if (code !in 200..299) requeue`; `URL("$serverUrl/api/events")` | **Fixed 2026-11-18** — classify 400/415/422; split 400/422 batches, shrink on 413, exponential backoff 30 s→5 min for transient failures, normalize base URL. Tests: `onlyPayloadAndMediaErrorsArePermanent`, `transientFailuresBackOffAndCap`, `serverUrlIsTrimmedAndHasNoDoubleSlash` |
+| F-26 | high | Android | Feature 1 ignored `AccessibilityNodeInfo.isPassword` / `AccessibilityEvent.isPassword`, so PIN, password, and OTP fields could enter keylogs and screen dumps. | `grep -c isPassword` → 0 before the fix | **Fixed 2026-11-18** — `NodeLike.isPassword`, password nodes skipped in direct reads, ancestor walks, and screen dumps; tests `passwordFieldsAreNeverExtracted`, `ancestorWalkSkipsSiblingPasswordField`, `passwordEventIsNotRecorded` |
+| F-27 | medium | Dashboard | Export temp JSONL files and the tarball were created with the umask (`0644`), archive members stored `0644`, and an interrupted export left the child's messages on disk. | `umask 022` export → `tar -tvzf` showed `-rw-r--r--` members; temp files had no explicit cleanup on error | **Fixed 2026-11-18** — `open_private()` (O_CREAT 0600 + fchmod), owner-only `TarInfo`, `finally` cleanup; test checks member modes and no leftovers |
+| F-28 | medium | Dashboard | Screen-time attributed an idle gap of up to **24 h** to whichever app was opened next. | old `min(gap, DAY_MS)` with `DAY_MS = 86400*1000` | **Fixed 2026-11-18** — `MAX_SESSION_GAP_MS = 5 min`; `compute_screen_durations()`; test proves an overnight gap adds 5 min, not 24 h |
+| F-29 | low | Dashboard | The interactive configure prompt printed the current parent token in clear text. | `input(f"  token [{cfg.get('token','')}]: ")` | **Fixed 2026-11-18** — prompt shows `set, N chars`; Enter keeps the existing secret |
+| F-30 | low | Rust server | Persistence used `flush()` without `fsync`, did not force `0600` on a pre-existing `state.tmp`, and created the data directory with the umask. A power loss could leave a truncated state file. | `write_snapshot` had `flush()` then `rename`; no `sync_all`; dir mode not set | **Fixed 2026-11-18** — `sync_all()` + directory fsync, `fchmod` the temp file, new dirs `0700`; test asserts `0600` file and `0700` directory |
+| F-31 | info | Rust server | `POST /api/events` deep-cloned the whole event array before processing; a 5,000-event batch allocated a second full copy. | `incoming = arr.clone()` / `obj.clone()` | **Improved 2026-11-18** — borrows the parsed slice; `events_accepts_a_single_object` covers the object form |
+| F-32 | high | Node collector | The legacy collector still had the token leaks and DoS gaps fixed only in Rust: `/health` returned the first 8 characters, `/api/register` echoed the full token, startup printed a user-supplied token, auth used `!==`, and bodies/children were unbounded. Retries also inflated counts. | old `/health` → `token: AUTH_TOKEN.slice(0,8)+'...'`; old register → `{childId, token: AUTH_TOKEN}`; old startup → `Parent token: ${AUTH_TOKEN}`; no `MAX_BODY` | **Fixed 2026-11-18** — token never returned or logged, constant-time compare, 2 MiB body cap, 2,000-child cap, bounded limits, dedupe by `(child,type,package,data,ts)`, device timestamps preserved; `node server/smoke_test.js` asserts each property |
+| F-33 | medium | Dashboard | Screen time was **always 0 for synced data**. `sync_from_server` inserts the server's newest-first response, but `screen_time` had no `ORDER BY`; every gap was negative, so no duration was accumulated. | DB `rowid` order `[newer, older]`; `--screen-time` showed `0m` for two events 24 h apart; adding `ORDER BY ts` showed `5m` | **Fixed 2026-11-18** — `ORDER BY ts` in SQL and a defensive sort in `compute_screen_durations()`; test feeds rows newest-first and expects the clamped 5 min |
+| F-34 | medium | Dashboard | Captured chat text was printed raw, so a message containing ANSI/OSC sequences could clear the screen, spoof output, or write the clipboard (OSC 52). Bidi controls could also spoof text direction. | a queued event containing `\x1b[2J`, `\x1b]52;…\x07`, and `\u202e` rendered those sequences to the terminal | **Fixed 2026-11-18** — `safe_text()` strips C0/C1 controls and bidi overrides on messages, reasons, package names, severities, and timestamps; test covers ESC/OSC/BEL/bidi; live CLI output contains no `ESC[2J`, OSC 52, or BEL |
+| F-35 | low | Dashboard | `--sync` without a terminal fell through to the interactive menu and raised `EOFError` (traceback) in cron/pipes/CI. | `--sync </dev/null` → `EOFError` at `input("  → ")` | **Fixed 2026-11-18** — non-TTY runs print a hint and exit 0; test `test_sync_without_a_tty_exits_cleanly` |
+| F-36 | high | Android | The first-run flow (`SetupActivity` → `DashboardActivity`) showed **"Monitoring: ON"** but never started `MonitorService`; only `MainActivity` did. A freshly configured phone collected nothing while the UI claimed it was protecting. | `grep -n startForegroundService` showed only `MainActivity` and the toggle branch; `DashboardActivity` read the preference and rendered it without acting | **Fixed 2026-11-18** — `DashboardActivity.onCreate` starts the service when the preference is true (START is idempotent); `DashboardActivityTest` asserts the start intent and that OFF does not start it |
+| F-37 | high | Android | `onStartCommand` returned `START_STICKY` for every path, including an explicit STOP. After process death Android recreated the service with a null intent, which matched no branch: the service came back with `isMonitoring=false`, no upload loop, and no foreground notification — monitoring silently died while the UI still said ON. | old `when (intent?.action)` had only START/STOP, followed by an unconditional `return START_STICKY` | **Fixed 2026-11-18** — STOP returns `START_NOT_STICKY`; a null intent resumes from the `KEY_MONITORING` preference or stops cleanly; `MonitorServiceLifecycleTest` covers all four paths |
+| F-38 | low | Dashboard | `--cleanup abc` reached `int(days)` and raised an uncaught `ValueError` traceback. | `--cleanup soon` → `ValueError: invalid literal for int()` | **Fixed 2026-11-18** — argparse `type=int`; test `test_cleanup_rejects_non_numeric_days` asserts a clean usage error and no traceback |
+| F-39 | medium | Node collector | `/api/stream` had no listener cap and no heartbeat, unlike the Rust collector. A few stuck dashboard tabs could pin unbounded memory, and an idle proxy could silently drop the stream. | old stream branch: `state.clients.add(res)` with no bound; no `setInterval` keepalive | **Fixed 2026-11-18** — `CHILDGUARD_MAX_STREAMS` (default 64), 25 s heartbeat, and `close`/`error` cleanup; smoke test opens a stream, asserts the next is `503`, then proves the slot is released |
+| F-40 | low | Dashboard | Removing keyword `0` from the menu silently removed the **last** keyword (Python negative indexing). | `int(input)-1` with no range check; `words.pop(-1)` succeeds | **Fixed 2026-11-18** — index range validated before `pop` |
+| F-41 | low | Dashboard | `--configure` printed the server URL without sanitizing terminal controls. | `print(f"  configured server={cfg.get('server')}")` | **Fixed 2026-11-18** — `safe_text()` on the printed value |
+| F-42 | medium | Both collectors | At 20,000 duplicate keys the set was **cleared**, so a retried upload of an event still inside the retained 5,000-event window could be stored again and re-raise its alert. | old code: `if st.seen.len() > MAX_DUPE_KEYS { st.seen.clear(); }` (Node: `state.seen.clear()`) | **Fixed 2026-11-18** — Rust `remember_seen()` keeps an insertion-order `VecDeque` and evicts only the oldest key; Node uses Set insertion order to delete one key. Test `dedupe_evicts_only_the_oldest_key` inserts 20,005 keys and proves `k0..k4` are gone while `k5` and the newest remain |
+| F-43 | low | Rust tests | `future_timestamp_is_sanitized` was **flaky**: it compared the clamped timestamp with a `now` captured before `handle_events()` took its own `now_ms()`. A one-millisecond difference made it fail intermittently. | `assert!(ev.ts <= now + TS_FUTURE_ALLOWANCE_MS)` using a pre-call `now` | **Fixed 2026-11-18** — bracket the call (`before`/`after`), assert against `after`, and assert `ev.ts < future`; 3 consecutive runs pass |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -271,32 +294,166 @@ server log: 0 occurrences of the supplied token
 ```
 
 
+## 5d. Daily audit — 2026-11-18, adversarial pass
+
+This pass deliberately tried to break the previous claims rather than confirm
+them. It found a payload artifact, two privacy leaks, a durability gap, two
+dashboard file-permission windows, and an upload loop that could never drain a
+permanent failure. Each fix below was reproduced first and re-tested after.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Repository | Tracked Metasploit APK + `handler.rc` | Removed at HEAD; ignore rules; docs cleaned | `aapt2` package `com.metasploit.stage`; `strings` `Lcom/metasploit/stage/MainActivity;`; `git ls-files` no longer lists either path |
+| Dashboard config | First write was `0644` | Atomic 0600 write | `stat -c %a` → `600` under `umask 022`; `test_fresh_config_is_owner_only_even_with_permissive_umask` |
+| Notifications | All packages captured, re-posts duplicated | Chat allowlist + 30 s dedupe, same in fallback | `nonChatAppIsIgnoredEntirely`, `repeatedIdenticalChatPostIsQueuedOnce`, `notificationFallbackIgnoresNonChatPackages` |
+| Password fields | `isPassword` ignored | Skip password nodes/events | `passwordFieldsAreNeverExtracted`, `passwordEventIsNotRecorded` |
+| Upload | Permanent 4xx retried forever at 15 s; `//api/events` | Classification, batch split/shrink, backoff, URL trim | `onlyPayloadAndMediaErrorsArePermanent`, `transientFailuresBackOffAndCap`, `serverUrlIsTrimmedAndHasNoDoubleSlash` |
+| Export | Temp files/tarball/members `0644`; crash leftovers | `open_private`, owner-only `TarInfo`, `finally` cleanup | `tar -tvzf` → `-rw-------` for all members; no temp files remain |
+| Screen time | 24 h idle gap counted as use; synced rows were newest-first so usage was always `0m` | 5 min session cap + `ORDER BY ts` + defensive sort | `test_idle_gap_is_not_counted_as_screen_time`; live DB now renders `Whatsapp 5m` |
+| Persistence | No `fsync`; temp mode not forced; dir `0755` | `sync_all`, dir fsync, `fchmod`, `0700` | `persisted_state_is_owner_only` asserts file `0600` and dir `0700` |
+| Configure prompt | Echoed the token | Masked hint | `grep` shows `set, N chars`, no token interpolation |
+| Legacy Node | Token prefix/echo/startup log; no caps; retries duplicated | Rust-parity auth, caps, dedupe, timestamps | `node server/smoke_test.js` → `SMOKE OK: auth, token non-disclosure, dedupe, caps, and liveness` |
+| Terminal output | Captured text could inject ANSI/OSC/bidi | `safe_text()` on all untrusted render paths | live CLI has no `ESC[2J`, OSC 52, or BEL; `test_terminal_escape_sequences_are_neutralized` |
+| Non-TTY | `--sync` raised `EOFError` | Clean hint + exit 0 | `test_sync_without_a_tty_exits_cleanly` |
+
+Why the fixes take these shapes:
+
+- **Split first, drop last.** A malformed event should not discard the 249
+  healthy events beside it. `400`/`422` halve the batch until one event is
+  isolated; only then is it dropped and counted. `413` shrinks the batch to
+  `max(25, n/2)` and keeps every event.
+- **Backoff is for recoverable failures only.** 401/403/404/408/429/5xx may
+  succeed after the token, URL, or server recovers; retrying a 415 content
+  type forever cannot. The old single branch treated both the same.
+- **Privacy is checked before allocation/read, not after.** The listener now
+  returns on a non-chat package before touching notification extras. The
+  accessibility fallback uses the same predicate, so binding state cannot
+  silently widen collection.
+- **Owner-only from creation, not after.** Both dashboard bugs came from
+  `open(path, "w")` / `tarfile.open(path, "w:gz")`: there is always a window
+  where the file has the umask mode, and a crash makes it permanent. O_CREAT
+  with `0600` plus `fchmod` removes the window; a `finally` removes leftovers.
+
+Verification for this pass:
+
+```
+payload:   aapt2 badging -> package com.metasploit.stage; minSdk 10
+           strings classes.dex -> Lcom/metasploit/stage/MainActivity;
+           handler.rc -> android/meterpreter/reverse_tcp / LPORT 4444
+           git ls-files | grep -E '\.apk$|handler\.rc' -> (none)
+server:    16 tests passed, 0 failed (cargo test --offline)
+           cargo clippy --offline -- -D warnings -> exit 0
+           node server/smoke_test.js -> SMOKE OK
+android:   46 tests, 0 failures, 0 skipped (live collector)
+           Extraction 15, Runtime 11, Notification 10, E2E 4, Batching 6
+dashboard: python3 -m unittest termux/test_dashboard.py -> 6 tests, OK
+           config.json 600; export tar 600; members -rw-------; no temp files
+screen:    synced newest-first rows -> ORDER BY ts; 24 h gap -> 5 min, not 0 or 24 h
+```
+
+## 5e. Daily audit — 2026-11-18, lifecycle and bounds pass
+
+The previous pass fixed data handling; this pass followed the *control* path and
+the remaining unbounded surfaces. It found that the app could look healthy while
+collecting nothing, that a system restart could silently disable monitoring, and
+that the Node stream endpoint still lacked the bounds already added in Rust.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| First-run start | Dashboard showed ON without starting the service | Start from `DashboardActivity` when enabled | `DashboardActivityTest` (2): start intent present, OFF does not start |
+| Service lifecycle | STOP was sticky; null-intent restart left a half-alive service | Branch-specific return codes; resume from preference | `MonitorServiceLifecycleTest` (4): sticky/not-sticky and resume/stop |
+| Dashboard CLI | `--cleanup abc` traceback; keyword `0` removed the last entry; configure printed raw URL | argparse `type=int`, index bounds, `safe_text()` | `test_cleanup_rejects_non_numeric_days`; range check; sanitized print |
+| Node SSE | Unbounded listeners, no heartbeat | Cap (default 64, env-overridable), 25 s ping, cleanup on close/error | smoke test: first stream 200, second 503, slot released after disconnect |
+| Duplicate keys | Full clear at the cap re-admitted in-flight retries | Oldest-only eviction in both collectors | `dedupe_evicts_only_the_oldest_key` (20,005 keys) |
+| Test flake | Timestamp test compared against a pre-call clock | Bracket the call | 3 consecutive runs pass |
+
+Why these shapes:
+
+- **The label must follow the service, not the preference.** A monitoring app
+  that says "ON" while idle is worse than one that says "OFF": the parent stops
+  looking. Starting from the screen that renders the state removes the split.
+- **Sticky is a promise to restart.** It is correct for START and wrong for
+  STOP. Handling the null intent explicitly is the only way to keep that
+  promise without resurrecting a service the parent turned off.
+- **Bounds belong on every long-lived collection.** Events, alerts, children,
+  duplicate keys, bodies, connections, and SSE listeners are now all capped in
+  both collectors; an authenticated but buggy client cannot exhaust the parent.
+
+Verification for this pass:
+
+```
+server:    cargo test --offline -> 17 passed; clippy -D warnings -> exit 0
+node:      node server/smoke_test.js ->
+           SMOKE OK: auth, token non-disclosure, dedupe, caps, stream limit, and liveness
+android:   52 tests, 0 failures, 0 skipped (live collector)
+           DashboardActivity 2, MonitorServiceLifecycle 4,
+           Extraction 15, Runtime 11, Notification 10, E2E 4, Batching 6
+dashboard: python3 -m unittest termux/test_dashboard.py -> 7 tests, OK
+```
+
+**Evidence correction.** The first dashboard end-to-end run in this pass used a
+`target/release/childguard-server` binary built on 2026-11-16, before the
+`fsync`/directory-permission changes. It reported the data directory as `770`.
+After `cargo build --release --offline`, the same test reports `700` for the
+directory and `600` for `state.json`. All numbers in section 6 come from the
+rebuilt binary; the stale-binary result is recorded here rather than hidden.
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 15 passed; 0 failed
+server-rust:  cargo test            → 17 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
-node server:  node server/smoke_test.js → SMOKE OK
-android:      35 tests, 0 failures, 0 skipped (with live server)
+node server:  node server/smoke_test.js → SMOKE OK (auth, token
+              non-disclosure, dedupe, caps, stream limit, liveness)
+android:      52 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
-              test classes: Feature1Extraction 13, Feature1Runtime 8,
-              Feature3Notification 7, Feature1ServerE2E 4, UploadBatching 3
+              test classes: Feature1Extraction 15, Feature1Runtime 11,
+              Feature3Notification 10, Feature1ServerE2E 4, UploadBatching 6,
+              DashboardActivity 2, MonitorServiceLifecycle 4
+dashboard:    python3 -m unittest termux/test_dashboard.py → 7 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
-              sha256 a3b622df...ec219578
+              sha256 157e1ce5...392894d9
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";
               7 events / 1 alert / HIGH alert / screen time rendered
               wrong token → 401 message; dead server → connection-refused
               message (no crash); config.json mode 600
-APK:          allowBackup=false, fullBackupContent=false,
-              dataExtractionRules present, WAKE_LOCK absent,
-              /system/bin/sh and ShellConnect absent from all dex files,
-              CgLog absent, event mask 0x187b, stale WebMonitor toast absent
-state.json:   -rw------- (600), 7 events / 1 alert / 2 children after E2E
+APK:          minSdk 26 / targetSdk 35, allowBackup=false,
+              fullBackupContent=false, dataExtractionRules present,
+              /system/bin/sh, ShellConnect, CgLog, metasploit, meterpreter,
+              and reverse_tcp all absent from every dex; isPassword present;
+              event mask 0x187b; stale WebMonitor toast absent
+payload scan: root *.apk and handler.rc absent from the tree and git index;
+              .gitignore blocks both
+state.json:   -rw------- (600), data dir drwx------ (700),
+              7 events / 1 alert / 2 children after E2E
 server log:   user-supplied token absent (`grep -c testsecret` → 0)
 network:      one unauthorized fetch (discord.com blog) happened in the first
               pass; its content has been removed from this document and no
               result depends on it. All other HTTP was to 127.0.0.1:38080;
               cargo/gradle ran with --offline.
 ```
+
+## 7. Efficiency: what could be faster, and why the current shape
+
+The brief asks not only for bugs but for *better ways to do it*. These are the
+places where a different design would be faster or smaller, and the reason the
+current one was kept. None of them is a correctness bug; they are conscious
+trade-offs, and each names the condition that would justify switching.
+
+| Area | Faster/smaller alternative | Why the current shape | When to switch |
+|---|---|---|---|
+| Collector persistence | Append-only event log + periodic compaction instead of serializing all state every 2 s | State is already bounded (5,000 events / 500 alerts), so one atomic snapshot is small, restores in one read, and cannot replay a half-written record. An append-only log needs truncation, crash recovery, and duplicate-on-replay handling. | If the event cap grows past ~50k or the host is SD-card-class. |
+| Dashboard sync | `GET /api/events?since=<last_ts>` delta instead of re-fetching the full 5,000-event window and `INSERT OR IGNORE` | The server has no `since` parameter, and a clock-skewed phone could hide rows from a naive delta. Re-inserting 5,000 rows is milliseconds in SQLite and is idempotent by `id`. | If the accepted event window grows or sync runs every few seconds. The safe version is server-side `ts > since` plus a small overlap. |
+| Dedupe set | Persist the keys (Bloom filter or SQLite table) so a collector restart cannot re-ingest a retried batch | Persisting 20k keys costs disk I/O on the same phone that is running the collector, while the retained event window is only 5,000; after a restart the overlap is small. Keys are now `u64` (~160 kB) instead of strings (~2 MB). | If restarts become frequent or the event window grows. |
+| Upload cadence | Server-sent events / push from the app | Mobile radio wake-ups are the dominant battery cost. A 15 s poll with exponential backoff (30 s → 5 min) keeps alerts timely and an outage cheap. | If sub-second parent alerts are required, use push (FCM) with an explicit privacy decision. |
+| Accessibility capture | Read only the focused node instead of a budgeted full-window dump | WebViews, custom chat lists, and IMEs often expose text only in siblings or the root tree. The dump is bounded by depth, node count, character count, an 800 ms gate, and a content hash, so cost is predictable. | If profiling on a low-end phone shows the dump dominates CPU. Target the focused subtree first. |
+| Screen time | Android `UsageStatsManager` | It needs the separate `PACKAGE_USAGE_STATS` special permission and gives OS-level totals, but the event-gap method needs no extra consent and is already available. The 5-minute session cap bounds the approximation error. | If minute-accurate totals matter more than the extra permission. |
+| Two collectors | Delete the Node collector and keep Rust only | Existing Node users and the legacy API are still exercised by `server/smoke_test.js`; the cost is duplicate maintenance, which is why both are brought to the same security behavior and tested. | If the Node path has no users; then remove it and its docs. |
+| Rust vs Node | Node measured **329 writes/s** vs Rust 227 on this host | Rust is kept for a 656 kB binary and 744 kB idle RSS on a phone, not for throughput. The audit states this plainly rather than claiming Rust is faster. | If throughput on a large host matters more than footprint, Node is the faster choice. |
+
+The rule behind these choices: **bound the work, then keep the simplest design
+that stays inside the bound.** A full snapshot, a full window, and a full tree
+dump are each cheap *because* caps make their size predictable. Removing a cap
+to chase speed is how this class of app turns one large screen into an ANR.

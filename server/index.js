@@ -1,40 +1,140 @@
 const http = require('http');
-const { spawn } = require('child_process');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 38080;
+const TOKEN_GENERATED = !process.env.CHILDGUARD_TOKEN;
 const AUTH_TOKEN = process.env.CHILDGUARD_TOKEN || crypto.randomBytes(24).toString('hex');
+
+const MAX_BODY = 2 * 1024 * 1024;
+const MAX_EVENTS = 5000;
+const MAX_ALERTS = 500;
+const MAX_CHILDREN = 2000;
+const MAX_DUPE_KEYS = 20000;
+const TS_FUTURE_ALLOWANCE_MS = 60 * 60 * 1000;
+// Cap SSE listeners the same way the Rust collector caps connections. One
+// leaked browser tab must not pin unbounded memory. Env-overridable so the
+// smoke test can exercise the limit with a single connection.
+const MAX_STREAMS = (() => {
+  const n = parseInt(process.env.CHILDGUARD_MAX_STREAMS, 10);
+  return Number.isFinite(n) && n > 0 ? n : 64;
+})();
+const SSE_HEARTBEAT_MS = 25000;
 
 const state = {
   children: new Map(),
   events: [],
   alerts: [],
   clients: new Set(),
-  maxEvents: 5000,
-  maxAlerts: 500,
+  seen: new Set(),
 };
 
 function now() { return Date.now(); }
 function uid() { return 'cg_' + crypto.randomBytes(8).toString('hex'); }
 
+/** Constant-time bearer comparison (length check first, as in the Rust server). */
+function timingSafeEqual(a, b) {
+  const ba = Buffer.from(a || '', 'utf8');
+  const bb = Buffer.from(b || '', 'utf8');
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+function authorized(req) {
+  return timingSafeEqual(req.headers.authorization || '', `Bearer ${AUTH_TOKEN}`);
+}
+
+function sendJson(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
+/**
+ * Read a request body with a hard cap. Exceeding the cap responds 413 and
+ * discards the rest instead of growing an unbounded string in memory.
+ */
+function readBody(req, res, onBody) {
+  let body = '';
+  let size = 0;
+  let tooLarge = false;
+  req.setEncoding('utf8');
+  req.on('data', chunk => {
+    size += Buffer.byteLength(chunk);
+    if (size > MAX_BODY) {
+      tooLarge = true;
+      return;
+    }
+    body += chunk;
+  });
+  req.on('end', () => {
+    if (tooLarge) {
+      sendJson(res, 413, { error: 'body too large' });
+      return;
+    }
+    onBody(body);
+  });
+  req.on('error', () => {
+    try { res.destroy(); } catch (e) {}
+  });
+}
+
+function bumpChild(id, name) {
+  if (state.children.size >= MAX_CHILDREN && !state.children.has(id)) {
+    const oldest = state.children.keys().next().value;
+    state.children.delete(oldest);
+  }
+  const child = { id, name, lastSeen: now(), registeredAt: now() };
+  state.children.set(id, child);
+  return child;
+}
+
 function broadcast(obj) {
   const payload = JSON.stringify(obj);
-  for (const c of state.clients) {
-    try { c.write('data: ' + payload + '\n\n'); } catch (e) {}
+  for (const c of [...state.clients]) {
+    try {
+      c.write('data: ' + payload + '\n\n');
+    } catch (e) {
+      state.clients.delete(c);
+    }
   }
 }
 
+/**
+ * Store one event with the same normalization/idempotency as the Rust server:
+ * bounded fields, clamped timestamp, and a duplicate hash so an upload retry
+ * cannot inflate counts or alerts. Returns false for a duplicate.
+ */
 function addEvent(childId, ev) {
-  ev.id = uid();
-  ev.ts = now();
-  state.events.push(ev);
-  if (state.events.length > state.maxEvents) state.events.shift();
-  if (ev.type === 'stranger_alert' || ev.type === 'stranger_notification') {
-    state.alerts.push(ev);
-    if (state.alerts.length > state.maxAlerts) state.alerts.shift();
+  const type = typeof ev.type === 'string' ? ev.type : 'unknown';
+  const pkg = typeof ev.package === 'string' ? ev.package : '';
+  const data = typeof ev.data === 'string'
+    ? ev.data
+    : (ev.data == null ? '' : JSON.stringify(ev.data));
+  const rawTs = Number(ev.ts);
+  const ts = Number.isFinite(rawTs)
+    ? Math.min(rawTs, now() + TS_FUTURE_ALLOWANCE_MS)
+    : now();
+
+  const key = crypto.createHash('sha1')
+    .update(`${childId}\0${type}\0${pkg}\0${data}\0${ts}`)
+    .digest('hex');
+  if (state.seen.has(key)) return false;
+  state.seen.add(key);
+  // JS Sets iterate in insertion order, so evict only the oldest key. The
+  // previous clear() forgot every recent key, letting an in-flight retry of a
+  // still-retained event be stored a second time.
+  while (state.seen.size > MAX_DUPE_KEYS) {
+    state.seen.delete(state.seen.values().next().value);
   }
-  broadcast({ type: 'event', childId, event: ev });
-  return ev;
+
+  const event = { id: uid(), ts, serverTs: now(), type, package: pkg, data, childId };
+  state.events.push(event);
+  if (state.events.length > MAX_EVENTS) state.events.shift();
+  if (type === 'stranger_alert' || type === 'stranger_notification') {
+    state.alerts.push(event);
+    if (state.alerts.length > MAX_ALERTS) state.alerts.shift();
+  }
+  broadcast({ type: 'event', childId, event });
+  return true;
 }
 
 function getStats() {
@@ -51,8 +151,15 @@ function getStats() {
   };
 }
 
+/** Parse a positive limit, falling back to the default and capping output. */
+function limitParam(raw, fallback, max) {
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(n, max);
+}
+
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -64,98 +171,106 @@ const server = http.createServer((req, res) => {
   }
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const auth = req.headers.authorization;
-  if (auth !== `Bearer ${AUTH_TOKEN}` && url.pathname !== '/health') {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'unauthorized' }));
+  if (url.pathname !== '/health' && !authorized(req)) {
+    sendJson(res, 401, { error: 'unauthorized' });
     return;
   }
 
   if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, token: AUTH_TOKEN.slice(0, 8) + '...', uptime: process.uptime() }));
+    // No token or token prefix: /health is deliberately unauthenticated.
+    sendJson(res, 200, { ok: true, service: 'childguard', uptime: process.uptime() });
     return;
   }
 
   if (url.pathname === '/api/register' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
-      try {
-        const d = JSON.parse(body);
-        const child = { id: uid(), name: d.name || 'Child', token: d.token, lastSeen: now(), registeredAt: now() };
-        state.children.set(child.id, child);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ childId: child.id, token: AUTH_TOKEN }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'invalid body' }));
+    readBody(req, res, body => {
+      let d;
+      try { d = JSON.parse(body); } catch (e) {
+        sendJson(res, 400, { error: 'invalid body' });
+        return;
       }
+      const name = (typeof d.name === 'string' && d.name.trim()) ? d.name.trim().slice(0, 128) : 'Child';
+      const child = bumpChild(uid(), name);
+      // Never echo the parent token; the client already has it.
+      sendJson(res, 200, { childId: child.id });
     });
     return;
   }
 
   if (url.pathname === '/api/events' && req.method === 'POST') {
-    req.setEncoding('utf8');
-    let body = '';
-    req.on('data', c => { body += c; });
-    req.on('end', () => {
+    readBody(req, res, body => {
       let d;
       try {
         d = JSON.parse(body);
       } catch (e) {
         console.error('[events] parse failed, bodyLen=' + body.length + ' err=' + e.message);
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'invalid body', detail: e.message }));
+        sendJson(res, 400, { error: 'invalid body' });
         return;
       }
-      let child = state.children.get(d.childId);
-      if (!child) {
-        // Auto-register unknown child ids so events are never dropped.
-        child = { id: d.childId, name: 'Child', token: '', lastSeen: now(), registeredAt: now() };
-        state.children.set(child.id, child);
+      if (typeof d.childId !== 'string' || !d.childId) {
+        sendJson(res, 400, { error: 'childId required' });
+        return;
       }
+      let events;
+      if (Array.isArray(d.events)) events = d.events;
+      else if (d.events && typeof d.events === 'object') events = [d.events];
+      else {
+        sendJson(res, 400, { error: 'events must be an array or object' });
+        return;
+      }
+
+      // Auto-register unknown child ids so events are never dropped.
+      const child = state.children.get(d.childId) || bumpChild(d.childId, 'Child');
       child.lastSeen = now();
-      const events = Array.isArray(d.events) ? d.events : [d.events];
-      for (const ev of events) addEvent(child.id, ev);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, received: events.length }));
+
+      let received = 0;
+      for (const ev of events.slice(0, MAX_EVENTS)) {
+        if (!ev || typeof ev !== 'object' || Array.isArray(ev)) continue;
+        if (addEvent(child.id, ev)) received += 1;
+      }
+      sendJson(res, 200, { ok: true, received });
     });
     return;
   }
 
   if (url.pathname === '/api/stats') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(getStats()));
+    sendJson(res, 200, getStats());
     return;
   }
 
   if (url.pathname === '/api/alerts') {
-    const limit = parseInt(url.searchParams.get('limit') || '100');
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ alerts: state.alerts.slice(-limit).reverse(), total: state.alerts.length }));
+    const limit = limitParam(url.searchParams.get('limit'), 100, MAX_ALERTS);
+    sendJson(res, 200, {
+      alerts: state.alerts.slice(-limit).reverse(),
+      total: state.alerts.length,
+    });
     return;
   }
 
   if (url.pathname === '/api/events') {
-    const limit = parseInt(url.searchParams.get('limit') || '200');
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ events: state.events.slice(-limit).reverse(), total: state.events.length }));
+    const limit = limitParam(url.searchParams.get('limit'), 200, MAX_EVENTS);
+    sendJson(res, 200, {
+      events: state.events.slice(-limit).reverse(),
+      total: state.events.length,
+    });
     return;
   }
 
   if (url.pathname === '/api/export') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       stats: getStats(),
-      events: state.events.slice(-5000).reverse(),
-      alerts: state.alerts.slice(-500).reverse(),
+      events: state.events.slice(-MAX_EVENTS).reverse(),
+      alerts: state.alerts.slice(-MAX_ALERTS).reverse(),
       exportedAt: now(),
-    }));
+    });
     return;
   }
 
   if (url.pathname === '/api/stream') {
+    if (state.clients.size >= MAX_STREAMS) {
+      sendJson(res, 503, { error: 'too many stream clients' });
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -163,16 +278,31 @@ const server = http.createServer((req, res) => {
     });
     state.clients.add(res);
     res.write('data: ' + JSON.stringify({ type: 'connected', stats: getStats() }) + '\n\n');
-    req.on('close', () => state.clients.delete(res));
+
+    // Match the Rust collector's heartbeat so an idle proxy does not drop a
+    // long-lived dashboard stream.
+    const heartbeat = setInterval(() => {
+      try { res.write(': ping\n\n'); } catch (e) { cleanup(); }
+    }, SSE_HEARTBEAT_MS);
+    function cleanup() {
+      clearInterval(heartbeat);
+      state.clients.delete(res);
+    }
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+    res.on('error', cleanup);
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'not found' }));
+  sendJson(res, 404, { error: 'not found' });
 });
 
 server.listen(PORT, () => {
   console.log(`ChildGuard server running on http://0.0.0.0:${PORT}`);
-  console.log(`Parent token: ${AUTH_TOKEN}`);
-  console.log(`Dashboard: http://0.0.0.0:${PORT}/dashboard.html`);
+  if (TOKEN_GENERATED) {
+    console.log(`Generated parent token (set CHILDGUARD_TOKEN to choose one): ${AUTH_TOKEN}`);
+  } else if (AUTH_TOKEN.length < 16) {
+    console.warn(`WARNING: parent token is only ${AUTH_TOKEN.length} characters; use 16+ random characters.`);
+  }
+  console.log('Endpoints: /health /api/register /api/events /api/stats /api/alerts /api/export /api/stream');
 });

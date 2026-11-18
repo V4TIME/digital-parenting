@@ -15,14 +15,16 @@ captured, delivered to the parent server, and rendered in the Termux dashboard.
 | `screen_active` | `TYPE_WINDOW_STATE_CHANGED` | activity class (powers screen time) |
 | `stranger_alert` | pattern hit (age/photo/meet/phone/…) | the matched text |
 | `service_connected` | `onServiceConnected` | online marker |
-| `notification` | fallback only, when the notification listener is NOT bound | notification text |
+| `notification` | fallback only, when the notification listener is NOT bound and the package is a known chat app | notification text |
 
 Delivery: `MonitorService` drains the queue every 15 s and POSTs
 `{"childId": ..., "events": [...]}` to the collector in **bounded batches**
-(250 events max). On any failure (no network, non-2xx) the batch is **requeued**
-(bounded at 1000) and retried; the server dedupes identical events, so retries
-never inflate counts. Un-batched leftovers stay queued for the next cycle, so a
-slow link still makes progress instead of re-sending one huge body forever.
+(250 events max). Transient failures (timeouts, 401/403/404, 429, 5xx) requeue
+the batch (bounded at 1000) with exponential backoff (30 s → 5 min). A
+`400`/`422` batch is split in half until the bad event is isolated; `413`
+shrinks the batch. The server dedupes identical events, so retries never
+inflate counts. Un-batched leftovers stay queued for the next cycle, so a slow
+link still makes progress instead of re-sending one huge body forever.
 
 Typed text is read from the source node when available and falls back to the
 event payload (`AccessibilityEvent.text`), which is how WebViews and some chat
@@ -42,6 +44,10 @@ fields report it — so a keystroke is not lost when no readable node exists.
 - **Content-based screen dedupe.** Identical `screen_text` dumps (cursor blink,
   timers, ads) are no longer uploaded over and over: only a changed dump is
   sent. This cuts mobile-data use and makes the dashboard readable.
+- **Password/PIN fields are never read.** `AccessibilityNodeInfo.isPassword`
+  and `AccessibilityEvent.isPassword` are honored in direct reads, sibling
+  walks, and screen dumps, so credentials and screen-lock codes cannot reach
+  the collector.
 - **Bounded upload batches.** 250 events per request, retries first, leftovers
   retained. Verified with 600 queued events: 250 + 250 + 100, no duplicates and
   nothing lost.
@@ -60,22 +66,24 @@ fields report it — so a keystroke is not lost when no readable node exists.
 
 ## Proof in the app (JVM unit tests)
 
-`android/app/src/test/java/com/childguard/app/Feature1ExtractionTest.kt` (13)
+`android/app/src/test/java/com/childguard/app/Feature1ExtractionTest.kt` (15)
 drives the real extraction logic through a fake node tree (`NodeLike`):
 
 - send-button click recovers the child EditText's text
 - click on a sibling button walks up and finds the EditText's text
+- password nodes are never extracted, including in sibling walks and dumps
 - 1000 null children return `""` quickly (no infinite loop)
 - a 60^6 lazy view tree returns within a node/time budget
 - identical screen dumps are suppressed; changed text is uploaded
 - ordinary app mentions/@mentions/URLs do not alert; grooming signals do
 - stranger patterns match/ignore correct text
 - notification classification emits `stranger_notification`
-- failed uploads keep events for retry
 
-`UploadBatchingTest.kt` (3) proves the upload pipeline: 600 queued events are
+`UploadBatchingTest.kt` (6) proves the upload pipeline: 600 queued events are
 sent as 250 + 250 + 100 with no duplicates, retry draining honours its limit,
-and notification events get the `data` field the dashboard reads.
+notification events get the `data` field the dashboard reads, permanent vs
+transient statuses are classified, backoff grows and caps, and URLs are
+normalized.
 
 Run on any build machine:
 
@@ -89,10 +97,11 @@ cd android && ./gradlew :app:testDebugUnitTest
 The logic tests above don't exercise `onAccessibilityEvent`. Two Robolectric
 tests do, on **Android 14 (API 34)**:
 
-- `Feature1RuntimeTest` (6 tests) builds the real service and feeds it real
-  `AccessibilityEvent`s: typing → `keylog` + `stranger_alert`, window change →
-  `screen_active`, notification fallback, `service_connected`, and
-  "nothing captured when monitoring is off".
+- `Feature1RuntimeTest` (11 tests) builds the real service and feeds it real
+  `AccessibilityEvent`s: typing → `keylog` + `stranger_alert`, password events
+  ignored, window change → `screen_active`, chat-only notification fallback
+  with dedupe, `service_connected`, and "nothing captured when monitoring is
+  off".
 - `Feature1ServerE2ETest` (4 tests) then runs the real
   `MonitorService.uploadQueuedEvents()` over HTTP against a live server:
   every queued event reaches it, a dead network requeues instead of dropping,

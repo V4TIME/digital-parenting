@@ -1,54 +1,139 @@
-// Regression test: an event from a device that never registered must be
-// accepted, not crash the process (it used to throw TypeError).
+// Regression tests for the legacy Node collector.
+//
+// Covers the crash that used to happen on an unregistered child, plus the
+// security parity fixes: no token in /health, /api/register, or startup logs;
+// constant-time auth; body/child caps; idempotent retries; timestamp clamping.
 const { spawn } = require('child_process');
 const http = require('http');
 const assert = require('assert');
 
 const PORT = 38999;
 const TOKEN = 'smoketoken';
+
 const srv = spawn(process.execPath, [__dirname + '/index.js'], {
-  env: { ...process.env, PORT: String(PORT), CHILDGUARD_TOKEN: TOKEN },
-  stdio: 'ignore',
+  env: {
+    ...process.env,
+    PORT: String(PORT),
+    CHILDGUARD_TOKEN: TOKEN,
+    CHILDGUARD_MAX_STREAMS: '1', // exercise the cap with two connections
+  },
+  stdio: ['ignore', 'pipe', 'pipe'],
 });
 
-function post(path, body) {
+let serverOutput = '';
+srv.stdout.on('data', c => { serverOutput += c.toString(); });
+srv.stderr.on('data', c => { serverOutput += c.toString(); });
+
+function request(method, path, body, token = TOKEN) {
   return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
+    const data = body === undefined ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+    const headers = { Authorization: 'Bearer ' + token };
+    if (data !== null) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(data);
+    }
     const req = http.request({
-      host: '127.0.0.1', port: PORT, path, method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        Authorization: 'Bearer ' + TOKEN,
-      },
+      host: '127.0.0.1', port: PORT, path, method, headers,
     }, res => {
       let out = '';
       res.on('data', c => out += c);
       res.on('end', () => resolve({ code: res.statusCode, body: out }));
     });
     req.on('error', reject);
-    req.write(data);
+    if (data !== null) req.write(data);
+    req.end();
+  });
+}
+
+// Open an SSE stream and keep the request alive so it occupies a slot.
+function openStream() {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port: PORT, path: '/api/stream', method: 'GET',
+      headers: { Authorization: 'Bearer ' + TOKEN },
+    }, res => resolve({ req, res, code: res.statusCode }));
+    req.on('error', reject);
     req.end();
   });
 }
 
 (async () => {
   await new Promise(r => setTimeout(r, 700));
-  // unregistered child id: this is what crashed the server before
-  const r = await post('/api/events', {
-    childId: 'cg_never_registered',
-    events: [{ type: 'keylog', package: 'com.whatsapp', data: 'hello', ts: 1 }],
-  });
-  assert.strictEqual(r.code, 200, 'event POST failed: ' + r.body);
-  assert.strictEqual(JSON.parse(r.body).received, 1);
 
-  // server must still be alive and answer a second request
-  const r2 = await post('/api/events', {
+  // 1. /health is unauthenticated but must not disclose the token or a prefix.
+  const health = await request('GET', '/health', undefined, '');
+  assert.strictEqual(health.code, 200, 'health failed: ' + health.body);
+  assert.strictEqual(JSON.parse(health.body).ok, true);
+  assert.ok(!health.body.includes(TOKEN), '/health leaked the token');
+  assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(health.body), 'token'),
+    '/health returned a token field');
+
+  // 2. Register must not echo the token.
+  const reg = await request('POST', '/api/register', { name: 'Eli' });
+  assert.strictEqual(reg.code, 200, 'register failed: ' + reg.body);
+  assert.ok(JSON.parse(reg.body).childId, 'register did not return childId');
+  assert.ok(!reg.body.includes(TOKEN), '/api/register leaked the token');
+
+  // 3. Wrong bearer is rejected.
+  const bad = await request('POST', '/api/events', { childId: 'x', events: [] }, 'wrong');
+  assert.strictEqual(bad.code, 401, 'wrong token was not rejected');
+
+  // 4. Missing childId is a client error, not a stored event.
+  const noChild = await request('POST', '/api/events', { events: [] });
+  assert.strictEqual(noChild.code, 400, 'missing childId should be 400');
+
+  // 5. An event from a device that never registered must be accepted (the
+  //    original crash), and an identical retry must not inflate counts.
+  const payload = {
     childId: 'cg_never_registered',
-    events: [{ type: 'keylog', package: 'com.whatsapp', data: 'again', ts: 2 }],
-  });
+    events: [{ type: 'keylog', package: 'com.whatsapp', data: 'hello', ts: 1234 }],
+  };
+  const r1 = await request('POST', '/api/events', payload);
+  assert.strictEqual(r1.code, 200, 'event POST failed: ' + r1.body);
+  assert.strictEqual(JSON.parse(r1.body).received, 1);
+
+  const r2 = await request('POST', '/api/events', payload);
   assert.strictEqual(r2.code, 200, 'server died after the first event');
-  console.log('SMOKE OK: unknown-child event accepted twice, server alive');
+  assert.strictEqual(JSON.parse(r2.body).received, 0, 'retry was counted twice');
+
+  const list = await request('GET', '/api/events?limit=10');
+  const stored = JSON.parse(list.body).events;
+  assert.strictEqual(stored.length, 1, 'retry inflated the event list');
+  assert.strictEqual(stored[0].data, 'hello');
+  assert.strictEqual(stored[0].ts, 1234, 'device timestamp was overwritten');
+
+  // 6. Oversized bodies are rejected instead of buffered without bound.
+  const huge = { childId: 'x', events: [], pad: 'a'.repeat(2 * 1024 * 1024 + 1) };
+  const big = await request('POST', '/api/events', huge);
+  assert.strictEqual(big.code, 413, 'oversized body should be 413');
+
+  // 7. Still alive, and the total did not change.
+  const stats = await request('GET', '/api/stats');
+  assert.strictEqual(stats.code, 200, 'server died after oversized request');
+  assert.strictEqual(JSON.parse(stats.body).totalEvents, 1);
+
+  // 8. A user-supplied token must never be printed at startup.
+  assert.ok(!serverOutput.includes(TOKEN), 'startup log leaked the user-supplied token');
+
+  // 9. SSE clients are capped (bounded memory) and the slot is released when
+  //    a client disconnects. Without this, one stuck dashboard tab could pin
+  //    an unbounded number of listeners.
+  const s1 = await openStream();
+  assert.strictEqual(s1.code, 200, 'first stream should connect');
+  const s2 = await openStream();
+  assert.strictEqual(s2.code, 503, 'stream cap was not enforced');
+  s2.res.resume();
+  s1.req.destroy();
+  await new Promise(r => setTimeout(r, 200));
+  const s3 = await openStream();
+  assert.strictEqual(s3.code, 200, 'stream slot was not released on disconnect');
+  s3.req.destroy();
+
+  console.log('SMOKE OK: auth, token non-disclosure, dedupe, caps, stream limit, and liveness');
   srv.kill();
   process.exit(0);
-})().catch(e => { console.error('SMOKE FAIL:', e.message); srv.kill(); process.exit(1); });
+})().catch(e => {
+  console.error('SMOKE FAIL:', e.message);
+  srv.kill();
+  process.exit(1);
+});

@@ -8,11 +8,13 @@ Two layers of proof, plus the small part that needs a real phone.
 
 | Test class | What it proves | Android runtime |
 |---|---|---|
-| `Feature1ExtractionTest` (13) | extraction/regex/retry logic on `NodeLike`, bounded view traversal, screen-dump dedupe, alert precision | none (pure JVM) |
-| `UploadBatchingTest` (3) | 600-event backlog → 250+250+100 batches, retry limit, notification `data` field | none (pure JVM) |
-| `Feature1RuntimeTest` (8) | **`onAccessibilityEvent` → `eventQueue`** on the real service, including the scroll-event subscription | Robolectric API 34 |
-| `Feature3NotificationTest` (7) | **`onNotificationPosted` → queue**, alert precision, non-chat filtering, queue cap | Robolectric API 34 |
+| `Feature1ExtractionTest` (15) | extraction/regex logic on `NodeLike`, password-field exclusion, bounded view traversal, screen-dump dedupe, alert precision | none (pure JVM) |
+| `UploadBatchingTest` (6) | 600-event backlog → 250+250+100 batches, retry limit, notification `data` field, failure classification, backoff, URL normalization | none (pure JVM) |
+| `Feature1RuntimeTest` (11) | **`onAccessibilityEvent` → `eventQueue`** on the real service, scroll subscription, password events ignored, chat-only fallback dedupe | Robolectric API 34 |
+| `Feature3NotificationTest` (10) | **`onNotificationPosted` → queue**, alert precision, chat-only allowlist, re-post dedupe, queue cap | Robolectric API 34 |
 | `Feature1ServerE2ETest` (4) | **`eventQueue` → `MonitorService` upload → server** | Robolectric API 34 + live server |
+| `DashboardActivityTest` (2) | **"Monitoring: ON" actually starts `MonitorService`** (first-run flow), and OFF does not | Robolectric API 34 |
+| `MonitorServiceLifecycleTest` (4) | explicit STOP is not sticky; a null-intent system restart resumes or stops cleanly | Robolectric API 34 |
 
 ```bash
 cd android
@@ -29,7 +31,8 @@ CHILDGUARD_SERVER=http://127.0.0.1:38080 CHILDGUARD_TOKEN=testsecret \
   gradle :app:cleanTestDebugUnitTest :app:testDebugUnitTest --tests "*Feature1ServerE2ETest"
 ```
 
-Last run: **35 tests, 0 failures** (4 E2E skipped when no server is configured).
+Last run: **52 tests, 0 failures, 0 skipped** (live collector; the 4 E2E tests
+skip when no server is configured).
 
 ### What `Feature1RuntimeTest` drives
 
@@ -39,9 +42,10 @@ It builds the real service with `Robolectric.buildService(...)` and calls the re
 - `TYPE_VIEW_TEXT_CHANGED` "hey kid whats your age" → queued `keylog` with the
   exact text, package, and timestamp, **plus** `stranger_alert`
 - harmless text → `keylog` only, no alert (no false accusations)
+- `TYPE_VIEW_TEXT_CHANGED` with `isPassword=true` → nothing queued
 - `TYPE_WINDOW_STATE_CHANGED` → `screen_active` with the activity class (screen time)
-- `TYPE_NOTIFICATION_STATE_CHANGED` → `notification` fallback when the
-  notification listener isn't bound
+- `TYPE_NOTIFICATION_STATE_CHANGED` → chat-only `notification` fallback when the
+  listener isn't bound; non-chat packages and repeated posts are ignored
 - `onServiceConnected` → `service_connected` online marker
 - monitoring off → nothing captured
 

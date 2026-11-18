@@ -88,7 +88,11 @@ struct AppState {
     alerts: VecDeque<Alert>,
     children: HashMap<String, Child>,
     sse: Vec<(String, mpsc::SyncSender<String>)>,
-    seen: HashSet<String>,
+    seen: HashSet<u64>,
+    /// Insertion order for `seen`, used to evict the oldest duplicate key
+    /// instead of clearing the whole set (which briefly re-admits retries).
+    /// u64 keys keep this ~160 kB at 20k entries instead of ~2 MB of strings.
+    seen_order: VecDeque<u64>,
     /// Set by mutating handlers; the background persister flushes it.
     dirty: bool,
 }
@@ -112,10 +116,22 @@ fn snapshot(st: &AppState) -> serde_json::Value {
 /// the owner only: the file holds the child's captured messages, so it must
 /// not be world-readable.
 fn write_snapshot(snapshot: &serde_json::Value, dir: &std::path::Path) {
+    // Only tighten a directory this process creates. If an operator points
+    // CHILDGUARD_DATA_DIR at an existing directory, changing its mode could
+    // break unrelated services (or /tmp).
+    let created_dir = !dir.exists();
     if let Err(e) = fs::create_dir_all(dir) {
         eprintln!("persist mkdir failed: {}", e);
         return;
     }
+    #[cfg(unix)]
+    if created_dir {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+            eprintln!("persist chmod dir failed: {}", e);
+        }
+    }
+
     let tmp = dir.join("state.tmp");
     let final_path = dir.join("state.json");
     let res = (|| -> std::io::Result<()> {
@@ -128,10 +144,25 @@ fn write_snapshot(snapshot: &serde_json::Value, dir: &std::path::Path) {
             opts.mode(0o600);
         }
         let mut f = opts.open(&tmp)?;
+        // mode() is ignored when the temp file already exists (for example
+        // after a crash), so force owner-only explicitly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         serde_json::to_writer(&mut f, snapshot).map_err(std::io::Error::other)?;
-        f.flush()?;
+        // rename() is atomic, but without fsync a power loss can leave an
+        // empty/partial file behind the rename. Flush the bytes first.
+        f.sync_all()?;
         drop(f);
         fs::rename(&tmp, &final_path)?;
+        // Persist the rename itself on filesystems that need a directory
+        // fsync. Failure here is not fatal (some platforms disallow it).
+        #[cfg(unix)]
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
         Ok(())
     })();
     if let Err(e) = res {
@@ -471,6 +502,23 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
     Ok((200, serde_json::json!({ "childId": id })))
 }
 
+/// Record a duplicate-detection key and keep the set bounded by evicting the
+/// **oldest** key. Clearing the set at the cap (the previous behavior) made an
+/// in-flight retry of a still-retained event look new again, inflating counts
+/// and re-raising alerts.
+fn remember_seen(st: &mut AppState, key: u64) -> bool {
+    if !st.seen.insert(key) {
+        return false;
+    }
+    st.seen_order.push_back(key);
+    while st.seen_order.len() > MAX_DUPE_KEYS {
+        if let Some(oldest) = st.seen_order.pop_front() {
+            st.seen.remove(&oldest);
+        }
+    }
+    true
+}
+
 fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serde_json::Value), u16> {
     if body.len() > MAX_BODY {
         return Err(413);
@@ -485,13 +533,14 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
         return Err(400);
     }
 
+    // Borrow the parsed events instead of deep-cloning the array. A 5,000
+    // event batch used to allocate a second full copy before doing any work.
     let raw_events = parsed.get("events");
-    let mut incoming: Vec<serde_json::Value> = Vec::new();
-    match raw_events {
-        Some(serde_json::Value::Array(arr)) => incoming = arr.clone(),
-        Some(obj @ serde_json::Value::Object(_)) => incoming.push(obj.clone()),
+    let incoming: &[serde_json::Value] = match raw_events {
+        Some(serde_json::Value::Array(arr)) => arr.as_slice(),
+        Some(obj @ serde_json::Value::Object(_)) => std::slice::from_ref(obj),
         _ => return Err(400),
-    }
+    };
 
     let now = now_ms();
     let mut st = lock_state(state);
@@ -511,7 +560,7 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
 
     let last_event = incoming.last().cloned();
     let mut received = 0usize;
-    for ev in incoming.into_iter().take(MAX_EVENTS) {
+    for ev in incoming.iter().take(MAX_EVENTS) {
         let type_ = ev.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let package = ev.get("package").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let data = match ev.get("data") {
@@ -533,12 +582,9 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
         package.hash(&mut hasher);
         data.hash(&mut hasher);
         ts.hash(&mut hasher);
-        let key = hasher.finish().to_string();
-        if !st.seen.insert(key.clone()) {
+        let key = hasher.finish();
+        if !remember_seen(&mut st, key) {
             continue; // duplicate
-        }
-        if st.seen.len() > MAX_DUPE_KEYS {
-            st.seen.clear();
         }
 
         let id = uid("e");
@@ -564,7 +610,7 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
                 ts,
                 severity: severity.to_string(),
                 reason: type_.clone(),
-                detail: serde_json::to_string(&ev).unwrap_or_default(),
+                detail: serde_json::to_string(ev).unwrap_or_default(),
             };
             st.alerts.push_back(alert);
             if st.alerts.len() > MAX_ALERTS {
@@ -729,6 +775,7 @@ fn main() {
         children: HashMap::new(),
         sse: Vec::new(),
         seen: HashSet::new(),
+        seen_order: VecDeque::new(),
         dirty: false,
     }));
     {
@@ -859,7 +906,6 @@ impl Drop for ConnectionGuard {
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -871,6 +917,7 @@ mod tests {
             children: HashMap::new(),
             sse: Vec::new(),
             seen: HashSet::new(),
+            seen_order: VecDeque::new(),
             dirty: false,
         }))
     }
@@ -1014,8 +1061,20 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(dir.join("state.json")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "state.json must be owner-only, got {:o}", mode);
+            let dmode = fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(dmode & 0o777, 0o700, "new data dir must be owner-only, got {:o}", dmode);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn events_accepts_a_single_object() {
+        // The borrowed-slice path must still accept the object form.
+        let state = test_state("secret");
+        let body = r#"{"childId":"cg_one","events":{"type":"keylog","package":"p","data":"x","ts":7}}"#;
+        let (code, val) = handle_events(&state, body.as_bytes()).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(val["received"].as_u64().unwrap(), 1);
     }
 
     #[test]
@@ -1042,19 +1101,48 @@ mod tests {
     }
 
     #[test]
+    fn dedupe_evicts_only_the_oldest_key() {
+        // A full clear() at the cap would forget every recent key, so a
+        // delayed retry of a still-retained event could be stored twice.
+        let state = test_state("secret");
+        let mut st = state.lock().unwrap();
+        for i in 0..(MAX_DUPE_KEYS as u64 + 5) {
+            assert!(remember_seen(&mut st, i));
+        }
+        assert_eq!(st.seen.len(), MAX_DUPE_KEYS);
+        assert_eq!(st.seen_order.len(), MAX_DUPE_KEYS);
+        assert!(!st.seen.contains(&0), "oldest keys must be evicted first");
+        assert!(!st.seen.contains(&4));
+        assert!(st.seen.contains(&5));
+        assert!(st.seen.contains(&(MAX_DUPE_KEYS as u64 + 4)));
+        // The newest key is still recognized as a duplicate.
+        assert!(!remember_seen(&mut st, MAX_DUPE_KEYS as u64 + 4));
+    }
+
+    #[test]
     fn future_timestamp_is_sanitized() {
         let state = test_state("secret");
-        let now = now_ms();
-        let future = now + 10_000_000_000; // ~116 days ahead
+        // Bracket the call: handle_events() uses its own now_ms(), which can be
+        // a millisecond later than a `now` captured before it. Comparing the
+        // clamped value against the earlier timestamp made this test flaky.
+        let before = now_ms();
+        let future = before + 10_000_000_000; // ~116 days ahead
         let body = format!(
             r#"{{"childId":"cg_ts","events":[{{"type":"keylog","package":"p","data":"x","ts":{}}}]}}"#,
             future
         );
         let (_code, _) = handle_events(&state, body.as_bytes()).unwrap();
+        let after = now_ms();
         let st = state.lock().unwrap();
         let ev = st.events.front().unwrap();
-        assert!(ev.ts <= now + TS_FUTURE_ALLOWANCE_MS);
-        assert!(ev.server_ts >= now.saturating_sub(10_000));
+        assert!(
+            ev.ts <= after + TS_FUTURE_ALLOWANCE_MS,
+            "ts {} exceeded the clamp bound {}",
+            ev.ts,
+            after + TS_FUTURE_ALLOWANCE_MS
+        );
+        assert!(ev.ts < future, "future timestamp was not clamped at all");
+        assert!(ev.server_ts >= before.saturating_sub(10_000));
     }
 
     #[test]

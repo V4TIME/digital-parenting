@@ -18,6 +18,12 @@ internal interface NodeLike {
     val contentDescription: CharSequence?
     val parent: NodeLike?
     val childCount: Int
+
+    /** True for password/PIN fields. Such nodes are never read: a parenting
+     *  monitor must not record credentials or screen-lock codes. Defaults to
+     *  false so simple test doubles stay valid. */
+    val isPassword: Boolean get() = false
+
     fun child(i: Int): NodeLike?
     fun recycle()
 }
@@ -26,6 +32,7 @@ internal interface NodeLike {
 internal class A11yNode(private val n: AccessibilityNodeInfo) : NodeLike {
     override val text: CharSequence? get() = n.text
     override val contentDescription: CharSequence? get() = n.contentDescription
+    override val isPassword: Boolean get() = n.isPassword
     override val parent: NodeLike? get() = n.parent?.let { A11yNode(it) }
     override val childCount: Int get() = n.childCount
     override fun child(i: Int): NodeLike? = n.getChild(i)?.let { A11yNode(it) }
@@ -53,6 +60,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         private const val MAX_QUEUE = 200
         private const val MAX_TEXT_LEN = 500
         private const val ALERT_MIN_GAP_MS = 10_000L
+        private const val NOTIFICATION_MIN_GAP_MS = 30_000L
         private const val SCREEN_MIN_GAP_MS = 800L
         private const val SCREEN_ACTIVE_GAP_MS = 1_000L
         private const val MAX_DEDUPE_KEYS = 64
@@ -96,6 +104,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         // Keyed throttle state. All are bounded; when they exceed the cap the
         // whole map is cleared (rare, and only affects throttling granularity).
         private val lastAlertByKey = HashMap<String, Long>()
+        private val lastNotificationByKey = HashMap<String, Long>()
         private val lastScreenByPkg = HashMap<String, Long>()
         private val lastKeyByPkg = HashMap<String, String>()
         private val lastScreenTextByPkg = HashMap<String, Int>()
@@ -116,6 +125,17 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             if (last != null && now - last < ALERT_MIN_GAP_MS) return false
             lastAlertByKey[key] = now
             if (lastAlertByKey.size > MAX_DEDUPE_KEYS) lastAlertByKey.clear()
+            return true
+        }
+
+        /** Fallback notification dedupe, mirroring the listener's 30 s window. */
+        internal fun shouldEmitNotification(pkg: String, text: String): Boolean {
+            val key = "$pkg\n${text.hashCode()}"
+            val now = System.currentTimeMillis()
+            val last = lastNotificationByKey[key]
+            if (last != null && now - last < NOTIFICATION_MIN_GAP_MS) return false
+            lastNotificationByKey[key] = now
+            if (lastNotificationByKey.size > MAX_DEDUPE_KEYS) lastNotificationByKey.clear()
             return true
         }
 
@@ -173,6 +193,7 @@ class ChildGuardAccessibilityService : AccessibilityService() {
          * cause a hang.
          */
         internal fun extractTextNear(node: NodeLike): String {
+            if (node.isPassword) return ""
             node.text?.toString()?.trim()?.let { if (it.length > 1) return it }
             node.contentDescription?.toString()?.trim()?.let { if (it.length > 1) return it }
 
@@ -190,6 +211,10 @@ class ChildGuardAccessibilityService : AccessibilityService() {
                     val child = parent.child(childIndex)
                     childIndex++ // always advance; null child cannot stall this loop
                     if (child == null) continue
+                    if (child.isPassword) {
+                        child.recycle()
+                        continue
+                    }
                     val t = try {
                         child.text?.toString()?.trim() ?: ""
                     } finally {
@@ -218,16 +243,18 @@ class ChildGuardAccessibilityService : AccessibilityService() {
         ) {
             if (depth > maxDepth || out.length >= maxChars || budget[0] <= 0) return
             budget[0]--
-            node.text?.toString()?.trim()?.let {
-                if (it.length > 1 && out.length < maxChars) {
-                    if (out.isNotEmpty()) out.append(' ')
-                    out.append(it.take(maxChars - out.length))
+            if (!node.isPassword) {
+                node.text?.toString()?.trim()?.let {
+                    if (it.length > 1 && out.length < maxChars) {
+                        if (out.isNotEmpty()) out.append(' ')
+                        out.append(it.take(maxChars - out.length))
+                    }
                 }
-            }
-            node.contentDescription?.toString()?.trim()?.let {
-                if (it.length > 1 && out.length < maxChars) {
-                    if (out.isNotEmpty()) out.append(' ')
-                    out.append(it.take(maxChars - out.length))
+                node.contentDescription?.toString()?.trim()?.let {
+                    if (it.length > 1 && out.length < maxChars) {
+                        if (out.isNotEmpty()) out.append(' ')
+                        out.append(it.take(maxChars - out.length))
+                    }
                 }
             }
             val count = if (depth >= maxDepth) 0 else minOf(node.childCount, MAX_CHILDREN_SCAN)
@@ -282,9 +309,14 @@ class ChildGuardAccessibilityService : AccessibilityService() {
                 // canonical source; only use this fallback when it is not bound
                 // so the same notification is never counted twice.
                 if (ChildGuardNotificationListener.isListenerConnected) return
+                // Same privacy boundary as the listener: never read banking,
+                // 2FA, or other non-chat notification text through the
+                // accessibility fallback.
+                if (!ChildGuardNotificationListener.isChatApp(pkg)) return
                 val texts = event.text?.joinToString(" ") ?: ""
                 if (texts.isNotEmpty()) {
                     val trimmed = texts.take(MAX_TEXT_LEN)
+                    if (!shouldEmitNotification(pkg, trimmed)) return
                     enqueueEvent("notification", pkg, trimmed)
                     if (isStrangerText(trimmed) && shouldFireAlert(pkg, trimmed)) {
                         enqueueEvent("stranger_alert", pkg, trimmed)
@@ -319,9 +351,12 @@ class ChildGuardAccessibilityService : AccessibilityService() {
 
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
             AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
+                // Never record password/PIN/OTP fields, even when the event
+                // itself (rather than the source node) carries the text.
+                if (event.isPassword) return
                 val fromNode = event.source?.let { node ->
                     try {
-                        node.text?.toString()?.trim() ?: ""
+                        if (node.isPassword) "" else node.text?.toString()?.trim() ?: ""
                     } finally {
                         node.recycle()
                     }

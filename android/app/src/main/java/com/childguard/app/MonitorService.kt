@@ -38,6 +38,33 @@ class MonitorService : Service() {
         private const val NOTIF_ID = 1
         private const val UPLOAD_INTERVAL_MS = 15_000L
         private const val MAX_BATCH = 250
+        private const val MIN_BATCH = 25
+        internal const val MAX_BACKOFF_MS = 300_000L
+        private const val KEY_DROPPED_EVENTS = "dropped_events_total"
+
+        /**
+         * Statuses where resending the same body cannot succeed. 400/422 are
+         * handled by splitting the batch first, so one malformed event cannot
+         * discard its healthy neighbours; 415 means the server will never
+         * accept this content type.
+         */
+        internal fun isPermanentFailure(code: Int): Boolean =
+            code == 400 || code == 415 || code == 422
+
+        /**
+         * Exponential backoff for transient failures: 30 s, 60 s, 120 s,
+         * 240 s, then capped at 5 min. A dead tailnet must not make the phone
+         * wake and retry every 15 s forever.
+         */
+        internal fun backoffDelayMs(consecutiveFailures: Int): Long {
+            if (consecutiveFailures <= 0) return UPLOAD_INTERVAL_MS
+            val shift = consecutiveFailures.coerceAtMost(5)
+            return (UPLOAD_INTERVAL_MS shl shift).coerceAtMost(MAX_BACKOFF_MS)
+        }
+
+        /** One source of truth for the endpoint base, so a saved trailing
+         * slash cannot produce `//api/events`. */
+        internal fun normalizeServerUrl(raw: String): String = raw.trim().trimEnd('/')
 
         var isMonitoring = false
             private set
@@ -137,14 +164,20 @@ class MonitorService : Service() {
 
     private var uploadThread: HandlerThread? = null
     private var uploadHandler: Handler? = null
+
+    // Only touched from the single upload HandlerThread.
+    private var consecutiveFailures = 0
+    private var batchLimit = MAX_BATCH
+
     private val uploadRunnable = object : Runnable {
         override fun run() {
-            try {
+            val delay = try {
                 uploadQueuedEvents()
             } catch (t: Throwable) {
                 Log.w(TAG, "upload pass failed", t)
+                backoffDelayMs(++consecutiveFailures)
             }
-            uploadHandler?.postDelayed(this, UPLOAD_INTERVAL_MS)
+            uploadHandler?.postDelayed(this, delay)
         }
     }
 
@@ -154,6 +187,7 @@ class MonitorService : Service() {
                 start()
                 startAsForeground()
                 startUploadLoop()
+                return START_STICKY
             }
             "childguard.STOP" -> {
                 stop()
@@ -165,9 +199,30 @@ class MonitorService : Service() {
                     stopForeground(true)
                 }
                 stopSelf()
+                // The parent explicitly stopped monitoring. Do not ask the
+                // system to resurrect the service later.
+                return START_NOT_STICKY
+            }
+            else -> {
+                // A null intent means Android recreated the process after
+                // killing it. The old code returned START_STICKY without
+                // restoring any state, so the service came back "running"
+                // but with isMonitoring=false and no foreground notification:
+                // monitoring silently stopped while the UI still said ON.
+                // Resume only if the parent still wants it.
+                val enabled = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
+                    .getBoolean(ChildGuardApp.KEY_MONITORING, false)
+                if (!enabled) {
+                    stop()
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                start()
+                startAsForeground()
+                startUploadLoop()
+                return START_STICKY
             }
         }
-        return START_STICKY
     }
 
     private fun startAsForeground() {
@@ -217,24 +272,29 @@ class MonitorService : Service() {
         uploadThread = null
     }
 
-    private fun uploadQueuedEvents() {
+    /**
+     * One upload pass. Returns how long to wait before the next pass, so a
+     * transient outage backs off instead of hammering the collector.
+     */
+    private fun uploadQueuedEvents(): Long {
         // One bounded batch per cycle. Retries first, leftovers remain queued.
-        val merged = takeUploadBatch()
-
-        if (merged.isEmpty()) return
+        val merged = takeUploadBatch(batchLimit)
+        if (merged.isEmpty()) return UPLOAD_INTERVAL_MS
 
         val childId = ensureRegistered() ?: run {
             requeue(merged)
-            return
+            return nextFailureDelay()
         }
 
         val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
-        val serverUrl = sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER)
-            ?: run {
-                Log.w(TAG, "no server URL configured; keeping events for retry")
-                requeue(merged)
-                return
-            }
+        val serverUrl = normalizeServerUrl(
+            sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: ""
+        )
+        if (serverUrl.isEmpty()) {
+            Log.w(TAG, "no server URL configured; keeping events for retry")
+            requeue(merged)
+            return nextFailureDelay()
+        }
         val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
 
         val body = JSONObject().apply {
@@ -255,14 +315,72 @@ class MonitorService : Service() {
             (conn.outputStream as OutputStream).write(body.toString().toByteArray(Charsets.UTF_8))
             val code = conn.responseCode
             conn.disconnect()
-            if (code !in 200..299) {
-                Log.w(TAG, "upload rejected code=$code; will retry")
-                requeue(merged)
+
+            if (code in 200..299) {
+                consecutiveFailures = 0
+                // Recover batch size after an earlier 413.
+                if (batchLimit < MAX_BATCH) batchLimit = minOf(MAX_BATCH, batchLimit * 2)
+                return UPLOAD_INTERVAL_MS
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "upload error: ${e.message}; will retry")
+
+            if (code == 413) {
+                // Body too large: shrink and resend soon. Evidence is kept.
+                if (merged.size > MIN_BATCH) {
+                    batchLimit = maxOf(MIN_BATCH, merged.size / 2)
+                    requeue(merged)
+                    consecutiveFailures = 0
+                    Log.w(TAG, "upload 413; shrinking batch to $batchLimit")
+                    return UPLOAD_INTERVAL_MS
+                }
+                Log.w(TAG, "upload 413 even at minimum batch; keeping events")
+                requeue(merged)
+                return nextFailureDelay()
+            }
+
+            if (code == 400 || code == 422) {
+                // Isolate the poison event: halve until one event remains,
+                // so good events on either side still reach the collector.
+                if (merged.size > 1) {
+                    val half = merged.size / 2
+                    requeue(merged.subList(0, half))
+                    requeue(merged.subList(half, merged.size))
+                    consecutiveFailures = 0
+                    Log.w(TAG, "upload $code; splitting ${merged.size} events into halves")
+                    return UPLOAD_INTERVAL_MS
+                }
+                recordDropped(1, code)
+                consecutiveFailures = 0
+                return UPLOAD_INTERVAL_MS
+            }
+
+            if (isPermanentFailure(code)) {
+                recordDropped(merged.size, code)
+                consecutiveFailures = 0
+                return UPLOAD_INTERVAL_MS
+            }
+
+            // 401/403/404/408/429/5xx and anything unknown: the same payload
+            // may succeed once the token, URL, or server recovers.
+            Log.w(TAG, "upload failed code=$code; retrying with backoff")
             requeue(merged)
+            return nextFailureDelay()
+        } catch (e: Exception) {
+            Log.w(TAG, "upload error: ${e.message}; retrying with backoff")
+            requeue(merged)
+            return nextFailureDelay()
         }
+    }
+
+    private fun nextFailureDelay(): Long {
+        consecutiveFailures += 1
+        return backoffDelayMs(consecutiveFailures)
+    }
+
+    private fun recordDropped(count: Int, code: Int) {
+        val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
+        val total = sp.getInt(KEY_DROPPED_EVENTS, 0) + count
+        sp.edit().putInt(KEY_DROPPED_EVENTS, total).apply()
+        Log.w(TAG, "server rejected $count event(s) with $code; dropped, total=$total")
     }
 
     /**
@@ -275,7 +393,10 @@ class MonitorService : Service() {
         val existing = sp.getString("child_id", "")
         if (!existing.isNullOrEmpty()) return existing
 
-        val serverUrl = sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: return null
+        val serverUrl = normalizeServerUrl(
+            sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: ""
+        )
+        if (serverUrl.isEmpty()) return null
         val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
         val name = sp.getString(ChildGuardApp.KEY_CHILD_NAME, "Child") ?: "Child"
 
