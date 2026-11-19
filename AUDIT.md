@@ -70,6 +70,13 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-41 | low | Dashboard | `--configure` printed the server URL without sanitizing terminal controls. | `print(f"  configured server={cfg.get('server')}")` | **Fixed 2026-11-18** — `safe_text()` on the printed value |
 | F-42 | medium | Both collectors | At 20,000 duplicate keys the set was **cleared**, so a retried upload of an event still inside the retained 5,000-event window could be stored again and re-raise its alert. | old code: `if st.seen.len() > MAX_DUPE_KEYS { st.seen.clear(); }` (Node: `state.seen.clear()`) | **Fixed 2026-11-18** — Rust `remember_seen()` keeps an insertion-order `VecDeque` and evicts only the oldest key; Node uses Set insertion order to delete one key. Test `dedupe_evicts_only_the_oldest_key` inserts 20,005 keys and proves `k0..k4` are gone while `k5` and the newest remain |
 | F-43 | low | Rust tests | `future_timestamp_is_sanitized` was **flaky**: it compared the clamped timestamp with a `now` captured before `handle_events()` took its own `now_ms()`. A one-millisecond difference made it fail intermittently. | `assert!(ev.ts <= now + TS_FUTURE_ALLOWANCE_MS)` using a pre-call `now` | **Fixed 2026-11-18** — bracket the call (`before`/`after`), assert against `after`, and assert `ev.ts < future`; 3 consecutive runs pass |
+| F-44 | medium | Android | `WebMonitorActivity` called `getPackageInfo()` once per installed app **on the UI thread**, then read `requestedPermissions`. On a phone with hundreds of apps that is hundreds of binder round-trips, can jank/ANR, and throws `NameNotFoundException` if an app disappears mid-scan. | `for (app in apps) { pm.getPackageInfo(app.packageName, 0) ... }` inside `onCreate` | **Fixed 2026-11-18** — one `getInstalledPackages(GET_PERMISSIONS)` call, scan moved to a daemon thread, labels loaded with exceptions contained; `WebMonitorActivityTest` proves an `INTERNET` app is listed and the view renders |
+| F-45 | low | Dashboard | Removing blocklist entry `0` popped the **last** entry (Python negative indexing), same class as F-40 but the blocklist copy was missed. | `bl.pop(int(input)-1)` with no bounds check | **Fixed 2026-11-18** — range validated; `test_blocklist_rejects_out_of_range_index` feeds `0` and asserts both entries survive |
+| F-46 | medium | Dashboard | `http_get_json` read the entire response body with `resp.read()` before parsing. Pointed at a hostile/large endpoint, the dashboard could allocate unbounded memory in Termux. | `return json.loads(resp.read().decode())` | **Fixed 2026-11-18** — streams in 64 KiB chunks and aborts above 32 MiB; `test_http_get_json_rejects_an_oversized_response` drives a fake response past the cap |
+| F-47 | low | Dashboard | `show_logs` called `data.lower()` on a nullable column, so one NULL row raised `AttributeError` and killed the whole log view. | `if any(k in data.lower() ...)` without a null guard | **Fixed 2026-11-18** — `data = data or ""`; `test_show_logs_survives_null_data` inserts an explicit NULL and renders |
+| F-48 | low | Dashboard | Server sync inserted `ts`/`type`/`package`/`data`/`severity` as received. A malformed response (string/null timestamp) tripped the `INTEGER NOT NULL` constraint and the row was silently dropped. | `ev.get("ts", ...)` passed straight to sqlite | **Fixed 2026-11-18** — `_clean_ts` coerces to int, every text field is stringified, ids fall back to a hash; `test_sync_coerces_bad_types_from_server` asserts all stored columns are the right type |
+| F-49 | low | Dashboard | `compute_screen_durations` sorted rows by raw `ts`; a text/NULL timestamp in an old or hand-edited DB raised `TypeError` and blanked the screen-time view. | `sorted(rows, key=lambda r: r[3])` | **Fixed 2026-11-18** — rows are coerced and non-numeric ones skipped; `test_screen_time_skips_non_numeric_timestamps` |
+| F-50 | medium | Rust server | `load_state_from` trusted `state.json` completely: an oversized file was read whole, and arrays were loaded with no `MAX_EVENTS`/`MAX_ALERTS`/`MAX_CHILDREN` bound, defeating the caps enforced on the request path. | `fs::read(path)` then `for ev in arr` with no length check | **Fixed 2026-11-18** — 64 MiB file gate and newest-N slicing per array; `load_state_ignores_an_oversized_file` and `load_state_caps_arrays_to_the_live_limits` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -398,21 +405,65 @@ After `cargo build --release --offline`, the same test reports `700` for the
 directory and `600` for `state.json`. All numbers in section 6 come from the
 rebuilt binary; the stale-binary result is recorded here rather than hidden.
 
+## 5f. Daily audit — 2026-11-18, input-trust pass
+
+This pass followed untrusted input across the three runtimes: what the Android
+UI trusts from `PackageManager`, what the dashboard trusts from a server
+response or its own SQLite file, and what the Rust collector trusts from
+`state.json`. Every finding below is a real crash, a silent data loss, or an
+unbounded allocation — not style.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Web monitor | Per-app `getPackageInfo()` on the UI thread (binder storm, `NameNotFoundException`) | One `getInstalledPackages(GET_PERMISSIONS)` call, off-main-thread scan | `WebMonitorActivityTest` lists a real `INTERNET` app |
+| Blocklist menu | `0` removed the last entry (negative index) | Bounds-check before `pop` | `test_blocklist_rejects_out_of_range_index` |
+| Dashboard HTTP | Whole body read before parse (unbounded memory) | 64 KiB chunks, 32 MiB cap | `test_http_get_json_rejects_an_oversized_response` |
+| Log view | NULL `data` raised `AttributeError` and killed the view | Coerce to `""` | `test_show_logs_survives_null_data` |
+| Sync | Bad `ts`/text types tripped `INTEGER NOT NULL` and dropped rows silently | Coerce ts to int, stringify text fields | `test_sync_coerces_bad_types_from_server` |
+| Screen time | Non-numeric `ts` raised `TypeError` in the sort | Skip unparseable rows | `test_screen_time_skips_non_numeric_timestamps` |
+| State load | `state.json` read whole; arrays loaded with no caps | 64 MiB gate + newest-N slicing | `load_state_ignores_an_oversized_file`, `load_state_caps_arrays_to_the_live_limits` |
+
+Why these shapes:
+
+- **Enumerate once, not per item.** `getInstalledPackages` returns permissions
+  in the same parcel as the app list. The per-app version was 2 binder calls
+  per app and an exception surface that could abort the whole scan.
+- **The dashboard is a client too.** It talks to a URL the parent types, so it
+  needs the same body cap the collector applies to requests. A dashboard that
+  OOMs on a bad response is a denial of service on the parent's own phone.
+- **Validate at the trust boundary, not at render time.** Coercing server data
+  and `state.json` on entry keeps every downstream query simple and means a
+  single bad row cannot blank a whole view.
+- **A file cap is not redundant with an array cap.** The array cap bounds live
+  state; the file cap bounds the cost of reading a corrupt file *before* any
+  JSON parsing. Both are needed because they fail at different stages.
+
+Verification for this pass:
+
+```
+server:    cargo test --offline -> 19 passed; clippy -D warnings -> exit 0
+node:      node server/smoke_test.js -> SMOKE OK (all assertions)
+android:   53 tests, 0 failures, 0 skipped (live collector)
+           + WebMonitorActivity 1
+dashboard: python3 -m unittest termux/test_dashboard.py -> 12 tests, OK
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 17 passed; 0 failed
+server-rust:  cargo test            → 19 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, stream limit, liveness)
-android:      52 tests, 0 failures, 0 skipped (with live server)
+android:      53 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
               Feature3Notification 10, Feature1ServerE2E 4, UploadBatching 6,
-              DashboardActivity 2, MonitorServiceLifecycle 4
-dashboard:    python3 -m unittest termux/test_dashboard.py → 7 passed
+              DashboardActivity 2, MonitorServiceLifecycle 4,
+              WebMonitorActivity 1
+dashboard:    python3 -m unittest termux/test_dashboard.py → 12 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
-              sha256 157e1ce5...392894d9
+              sha256 7dabac98...e4eec7ba
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";

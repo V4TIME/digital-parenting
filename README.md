@@ -6,7 +6,7 @@
   running on hardware and a network you control.
   <br><br>
   <img src="docs/badges/android.svg" alt="Android: target SDK 35" height="28">
-  <img src="docs/badges/tests.svg" alt="52 tests passing" height="28">
+  <img src="docs/badges/tests.svg" alt="53 tests passing" height="28">
   <img src="docs/badges/rust.svg" alt="Rust collector, 656 kB" height="28">
   <img src="docs/badges/network.svg" alt="Tailnet only" height="28">
   <!-- Local SVG assets only: no external badge services. Keep tests.svg in sync. -->
@@ -25,8 +25,8 @@
 > [!NOTE]
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
-> dashboard. The full suite is **52 tests, 0 failures, 0 skipped** against a
-> live collector, plus 17 collector tests and 7 dashboard regression tests.
+> dashboard. The full suite is **53 tests, 0 failures, 0 skipped** against a
+> live collector, plus 19 collector tests and 12 dashboard regression tests.
 > Remaining work is a run on a physical phone; no Android device or KVM is
 > available in the build environment.
 
@@ -177,14 +177,14 @@ method are in [`AUDIT.md`](AUDIT.md) and [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 
 | Layer | Command | Last result |
 |---|---|---|
-| Collector unit tests | `cargo test --offline` | **17 passed, 0 failed** |
-| Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **7 passed, 0 failed** |
+| Collector unit tests | `cargo test --offline` | **19 passed, 0 failed** |
+| Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **12 passed, 0 failed** |
 | Collector lints | `cargo clippy --offline -- -D warnings` | **exit 0** |
 | Legacy collector | `node server/smoke_test.js` | **SMOKE OK** |
-| Android suite | `gradle :app:testDebugUnitTest --offline` | **52 tests, 0 failures, 0 skipped** |
+| Android suite | `gradle :app:testDebugUnitTest --offline` | **53 tests, 0 failures, 0 skipped** |
 | Connection | `python3 termux/dashboard.py --doctor` | **exit 0**, live counts |
 | Failure modes | wrong token / dead collector | **exit 3 / exit 2**, no crash |
-| APK | `:app:assembleDebug` | 7,400,089 bytes, `sha256 157e1ce5…392894d9` |
+| APK | `:app:assembleDebug` | 7,400,089 bytes, `sha256 7dabac98…e4eec7ba` |
 
 The Android suite includes real `onAccessibilityEvent` and
 `onNotificationPosted` calls under Robolectric API 34, plus four tests that

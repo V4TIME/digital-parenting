@@ -1,7 +1,6 @@
 package com.childguard.app
 
-import android.content.Intent
-import android.content.pm.PackageInfo
+import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Button
@@ -10,6 +9,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.childguard.app.R
 
 class WebMonitorActivity : AppCompatActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_web_monitor)
@@ -19,27 +19,55 @@ class WebMonitorActivity : AppCompatActivity() {
         val btnBack = findViewById<Button>(R.id.btn_back)
 
         tvTitle.text = "Web Monitor"
+        tvStatus.text = "Scanning installed apps…"
 
-        val pm = packageManager
-        val installed = ArrayList<Pair<String, String>>()
-        val apps = pm.getInstalledApplications(PackageManager.GET_PERMISSIONS)
-        for (app in apps) {
-            val pi = pm.getPackageInfo(app.packageName, 0)
-            val hasNet = pi.requestedPermissions?.any {
-                it == "android.permission.INTERNET" || it == "android.permission.ACCESS_NETWORK_STATE"
-            } == true
-            if (hasNet) {
-                installed.add(app.packageName to (app.loadLabel(pm)?.toString() ?: app.packageName))
+        // PackageManager enumerates every app and loads labels; doing that on
+        // the UI thread can jank or ANR on a phone with hundreds of apps.
+        Thread {
+            val rows = scanInternetApps()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                val sb = StringBuilder()
+                sb.append("Internet-capable apps on device: ${rows.size}\n\n")
+                rows.forEach { (pkg, label) ->
+                    sb.append("• $label\n   $pkg\n")
+                }
+                tvStatus.text = sb.toString()
             }
-        }
-
-        val sb = StringBuilder()
-        sb.append("Internet-capable apps on device: ${installed.size}\n\n")
-        installed.sortedBy { it.second.lowercase() }.forEach { (pkg, label) ->
-            sb.append("• $label\n   $pkg\n")
-        }
-        tvStatus.text = sb.toString()
+        }.apply { isDaemon = true }.start()
 
         btnBack.setOnClickListener { finish() }
+    }
+
+    /**
+     * Every app that can reach the network. `getInstalledPackages` returns the
+     * permission list in one binder call, so this avoids a per-app
+     * getPackageInfo() round-trip and cannot throw NameNotFoundException if an
+     * app is uninstalled mid-scan.
+     */
+    internal fun scanInternetApps(): List<Pair<String, String>> {
+        val pm = packageManager
+        val out = ArrayList<Pair<String, String>>()
+        val packages = try {
+            pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
+        } catch (t: Throwable) {
+            return out
+        }
+        for (pi in packages) {
+            val perms = pi.requestedPermissions ?: continue
+            val hasNet = perms.any {
+                it == Manifest.permission.INTERNET ||
+                    it == Manifest.permission.ACCESS_NETWORK_STATE
+            }
+            if (!hasNet) continue
+            val app = pi.applicationInfo ?: continue
+            val label = try {
+                app.loadLabel(pm)?.toString()
+            } catch (t: Throwable) {
+                null
+            } ?: app.packageName
+            out.add(app.packageName to label)
+        }
+        return out.sortedBy { it.second.lowercase() }
     }
 }

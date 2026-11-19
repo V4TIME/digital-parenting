@@ -143,6 +143,122 @@ class ConfigPermissionTest(unittest.TestCase):
         self.assertNotIn("Traceback", proc.stderr)
         self.assertIn("invalid int value", proc.stderr)
 
+    def test_screen_time_skips_non_numeric_timestamps(self):
+        dd = self._load_dashboard()
+        rows = [
+            ("com.whatsapp", "screen_text", "", 20_000),
+            ("com.whatsapp", "screen_text", "", "not-a-timestamp"),
+            ("com.whatsapp", "screen_text", "", None),
+            ("com.whatsapp", "screen_text", "", 10_000),
+        ]
+        # A hand-edited DB or an old schema can hold text/NULL ts; the sort
+        # used to raise TypeError and kill the screen-time view.
+        total, duration = dd.compute_screen_durations(rows)
+        self.assertEqual(2, total["com.whatsapp"])
+        self.assertEqual(10_000, duration["com.whatsapp"])
+        # Durations feed integer arithmetic in screen_time(); a float here
+        # raised "can't multiply sequence by non-int of type 'float'".
+        self.assertIsInstance(duration["com.whatsapp"], int)
+        self.assertEqual("#", "#" * (duration["com.whatsapp"] // 60000 + 1))
+
+    def test_show_logs_survives_null_data(self):
+        dd = self._load_dashboard()
+        con = dd.ensure_env()
+        con.execute(
+            "INSERT INTO events(id,ts,type,package,data,child) VALUES(?,?,?,?,?,?)",
+            ("null-row", 1, "keylog", "com.whatsapp", None, "c"),
+        )
+        con.commit()
+        # `data.lower()` used to raise AttributeError on NULL and abort the log.
+        try:
+            dd.show_logs(con, None)
+        finally:
+            con.close()
+
+    def test_sync_coerces_bad_types_from_server(self):
+        dd = self._load_dashboard()
+        con = dd.ensure_env()
+        payload_events = {
+            "events": [
+                {"id": "bad-ts", "ts": "oops", "type": None,
+                 "package": None, "data": None, "childId": None},
+                {"ts": None, "type": "keylog", "package": "p", "data": "x"},
+            ]
+        }
+        payload_alerts = {"alerts": [{"id": "bad-alert", "ts": "x",
+                                      "severity": None, "reason": None,
+                                      "detail": {"nested": 1}}]}
+
+        def fake_get(url, token, timeout=10):
+            return payload_alerts if url.endswith("/api/alerts?limit=500") else payload_events
+
+        original = dd.http_get_json
+        dd.http_get_json = fake_get
+        try:
+            added = dd.sync_from_server(con, {"server": "http://x", "token": "t"},
+                                        verbose=False)
+        finally:
+            dd.http_get_json = original
+        self.assertEqual(3, added)
+        rows = con.execute("SELECT ts,type,package,data,child FROM events "
+                           "ORDER BY id").fetchall()
+        for ts, typ, pkg, data, child in rows:
+            self.assertIsInstance(ts, int, f"ts not coerced: {ts!r}")
+            self.assertIsInstance(typ, str)
+            self.assertIsInstance(pkg, str)
+            self.assertIsInstance(data, str)
+            self.assertIsInstance(child, str)
+        con.close()
+
+    def test_http_get_json_rejects_an_oversized_response(self):
+        dd = self._load_dashboard()
+
+        class FakeResponse:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n=-1):
+                return self._chunks.pop(0) if self._chunks else b""
+
+        chunk = b"x" * 65536
+        count = (dd.MAX_RESPONSE_BYTES // len(chunk)) + 2
+        original = dd.urllib.request.urlopen
+        dd.urllib.request.urlopen = lambda req, timeout=10: FakeResponse(
+            [chunk] * count
+        )
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                dd.http_get_json("http://x/api/events", "t")
+            self.assertIn("exceeded", str(ctx.exception))
+        finally:
+            dd.urllib.request.urlopen = original
+
+    def test_blocklist_rejects_out_of_range_index(self):
+        dd = self._load_dashboard()
+        con = dd.ensure_env()
+        dd.set_cfg(con, dd.BLOCKLIST_KEY, ["com.keep", "com.also-keep"])
+        answers = iter(["r", "0", "d"])  # 0 - 1 == -1 would pop the last item
+
+        def fake_input(prompt=""):
+            return next(answers)
+
+        import builtins
+        saved = builtins.input
+        builtins.input = fake_input
+        try:
+            dd.manage_blocklist(con)
+        finally:
+            builtins.input = saved
+        self.assertEqual(["com.keep", "com.also-keep"],
+                         dd.get_cfg(con, dd.BLOCKLIST_KEY, []))
+        con.close()
+
     def test_terminal_escape_sequences_are_neutralized(self):
         dd = self._load_dashboard()
         attacks = [

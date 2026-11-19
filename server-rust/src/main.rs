@@ -42,6 +42,10 @@ const MAX_CHILDREN: usize = 2000;
 const MAX_CONNECTIONS: usize = 256;
 const SSE_HEARTBEAT_SECS: u64 = 25;
 const MAX_DUPE_KEYS: usize = 20_000;
+/// Upper bound on the persisted state file accepted at startup. The live caps
+/// already limit what this process writes; this protects against a corrupt or
+/// hand-edited file that would otherwise be read and re-serialized in full.
+const MAX_STATE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 /// How often dirty state is flushed to disk. Writes used to happen inline on
 /// every request, which made the collector disk-bound (~8 req/s).
 const PERSIST_INTERVAL_MS: u64 = 2_000;
@@ -187,30 +191,48 @@ fn load_state(st: &mut AppState) {
 }
 
 fn load_state_from(st: &mut AppState, path: &std::path::Path) {
+    // The file is normally written by this process and already bounded, but a
+    // corrupt or hand-edited state.json must not be able to defeat the same
+    // caps the request path enforces (a 1 GB file would otherwise be loaded
+    // into memory and then re-serialized on the first persist tick).
     let raw = match fs::read(path) {
         Ok(r) => r,
         Err(_) => return,
     };
+    if raw.len() > MAX_STATE_BYTES {
+        eprintln!(
+            "state file {} is {} bytes, above the {} byte cap; ignoring it",
+            path.display(),
+            raw.len(),
+            MAX_STATE_BYTES
+        );
+        return;
+    }
     let parsed: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(_) => return,
     };
     if let Some(arr) = parsed.get("events").and_then(|v| v.as_array()) {
-        for ev in arr {
+        // Load at most the cap, keeping the newest entries (the file stores
+        // oldest-first, like the live VecDeque).
+        let start = arr.len().saturating_sub(MAX_EVENTS);
+        for ev in &arr[start..] {
             if let Ok(e) = serde_json::from_value::<Event>(ev.clone()) {
                 st.events.push_back(e);
             }
         }
     }
     if let Some(arr) = parsed.get("alerts").and_then(|v| v.as_array()) {
-        for al in arr {
+        let start = arr.len().saturating_sub(MAX_ALERTS);
+        for al in &arr[start..] {
             if let Ok(a) = serde_json::from_value::<Alert>(al.clone()) {
                 st.alerts.push_back(a);
             }
         }
     }
     if let Some(arr) = parsed.get("children").and_then(|v| v.as_array()) {
-        for ch in arr {
+        let start = arr.len().saturating_sub(MAX_CHILDREN);
+        for ch in &arr[start..] {
             if let Ok(c) = serde_json::from_value::<Child>(ch.clone()) {
                 st.children.insert(c.id.clone(), c);
             }
@@ -1166,6 +1188,81 @@ mod tests {
             assert_eq!(st.alerts.len(), 1);
             assert_eq!(st.events[0].data, "hey kid");
             assert!(st.children.contains_key("cg_pers"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_caps_arrays_to_the_live_limits() {
+        // A corrupt or hand-edited state.json must not defeat the caps the
+        // request path enforces. The loader keeps the newest entries.
+        let dir = std::env::temp_dir().join(format!("cg_loadcap_{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events: Vec<serde_json::Value> = (0..(MAX_EVENTS + 10))
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("e{}", i),
+                    "ts": i as u64,
+                    "serverTs": i as u64,
+                    "type": "keylog",
+                    "package": "p",
+                    "data": format!("{}", i),
+                    "childId": "c",
+                })
+            })
+            .collect();
+        let alerts: Vec<serde_json::Value> = (0..(MAX_ALERTS + 10))
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("a{}", i),
+                    "ts": i as u64,
+                    "severity": "info",
+                    "reason": "r",
+                    "detail": "{}",
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "events": events,
+            "alerts": alerts,
+            "children": [],
+        });
+        let path = dir.join("state.json");
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+
+        let state = test_state("secret");
+        {
+            let mut st = state.lock().unwrap();
+            load_state_from(&mut st, &path);
+            assert_eq!(st.events.len(), MAX_EVENTS);
+            assert_eq!(st.alerts.len(), MAX_ALERTS);
+            // Newest-first tail is retained, not the oldest head.
+            assert_eq!(st.events.front().unwrap().data, "10");
+            assert_eq!(
+                st.events.back().unwrap().data,
+                format!("{}", MAX_EVENTS + 9)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_ignores_an_oversized_file() {
+        let dir = std::env::temp_dir().join(format!("cg_loadbig_{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        // Valid-prefix-free padding is enough: the size gate must reject it
+        // before any JSON parsing or allocation of the array.
+        let big = vec![b' '; MAX_STATE_BYTES + 1];
+        std::fs::write(&path, &big).unwrap();
+
+        let state = test_state("secret");
+        {
+            let mut st = state.lock().unwrap();
+            load_state_from(&mut st, &path);
+            assert_eq!(st.events.len(), 0);
+            assert_eq!(st.alerts.len(), 0);
+            assert_eq!(st.children.len(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

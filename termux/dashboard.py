@@ -224,12 +224,30 @@ def set_cfg(con, key, value):
 # --------------------------------------------------------------------------
 # Server sync
 # --------------------------------------------------------------------------
+# The collector caps its own responses, but the dashboard is also pointed at
+# whatever URL the parent typed. A hostile or buggy endpoint could stream a
+# multi-gigabyte body and exhaust Termux memory; read at most this much.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
 def http_get_json(url, token, timeout=10):
     req = urllib.request.Request(url)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        # Read in bounded chunks so a missing/incorrect Content-Length cannot
+        # make .read() allocate without limit.
+        buf = bytearray()
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > MAX_RESPONSE_BYTES:
+                raise ValueError(
+                    f"response from {url} exceeded {MAX_RESPONSE_BYTES} bytes"
+                )
+        return json.loads(buf.decode("utf-8"))
 
 
 def run_doctor(cfg, timeout=5):
@@ -319,10 +337,25 @@ def sync_from_server(con, cfg, verbose=True):
             print(red(f"Sync failed: {e}"))
         return 0
 
-    for ev in ev_resp.get("events", []):
-        _id = ev.get("id") or "e" + hashlib.sha1(
-            json.dumps(ev, sort_keys=True).encode("utf-8")
+    def _clean_id(obj, prefix):
+        raw = obj.get("id")
+        if isinstance(raw, str) and raw:
+            return raw
+        return prefix + hashlib.sha1(
+            json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:16]
+
+    def _clean_ts(raw):
+        # INSERT declares ts INTEGER NOT NULL, but a malformed/hostile server
+        # response can send a string or null. Coerce to an int instead of
+        # letting sqlite raise and silently drop the row.
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return int(time.time() * 1000)
+
+    for ev in ev_resp.get("events", []):
+        _id = _clean_id(ev, "e")
         try:
             before = con.total_changes
             con.execute(
@@ -330,20 +363,19 @@ def sync_from_server(con, cfg, verbose=True):
                 "VALUES(?,?,?,?,?,?)",
                 (
                     _id,
-                    ev.get("ts", time.time() * 1000),
-                    ev.get("type", "unknown"),
-                    ev.get("package", ""),
-                    ev.get("data", ""),
-                    ev.get("childId", "default"),
+                    _clean_ts(ev.get("ts")),
+                    str(ev.get("type") or "unknown"),
+                    str(ev.get("package") or ""),
+                    str(ev.get("data") or ""),
+                    str(ev.get("childId") or "default"),
                 ),
             )
             added += con.total_changes - before
         except Exception:
             pass
     for al in al_resp.get("alerts", []):
-        _id = al.get("id") or "a" + hashlib.sha1(
-            json.dumps(al, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
+        _id = _clean_id(al, "a")
+        detail = al.get("detail")
         try:
             before = con.total_changes
             con.execute(
@@ -351,10 +383,10 @@ def sync_from_server(con, cfg, verbose=True):
                 "VALUES(?,?,?,?,?)",
                 (
                     _id,
-                    al.get("ts", time.time() * 1000),
-                    al.get("severity", "info"),
-                    al.get("reason") or al.get("type", "alert"),
-                    al.get("detail") if isinstance(al.get("detail"), str) else json.dumps(al),
+                    _clean_ts(al.get("ts")),
+                    str(al.get("severity") or "info"),
+                    str(al.get("reason") or al.get("type") or "alert"),
+                    detail if isinstance(detail, str) else json.dumps(al),
                 ),
             )
             added += con.total_changes - before
@@ -493,7 +525,20 @@ def compute_screen_durations(rows, max_gap_ms=MAX_SESSION_GAP_MS):
     # Sync stores the server's newest-first response, so rows are not
     # necessarily chronological. Sorting here keeps the helper correct even
     # when a caller forgets ORDER BY (Timsort is linear on sorted input).
-    for pkg, _typ, _data, ts in sorted(rows, key=lambda r: r[3]):
+    #
+    # `ts` is normally an int, but a hand-edited DB or an old schema can hold
+    # text/NULL. Skip rows with a non-numeric timestamp instead of raising
+    # TypeError in the sort (which killed the whole screen-time view).
+    clean = []
+    for pkg, _typ, _data, ts in rows:
+        try:
+            # Keep timestamps integral: durations are rendered with integer
+            # arithmetic (`"#" * (ms // 60000)`), and float durations raise
+            # TypeError there. Accept "123.0" but store 123.
+            clean.append((str(pkg or ""), int(float(ts))))
+        except (TypeError, ValueError):
+            continue
+    for pkg, ts in sorted(clean, key=lambda r: r[1]):
         total[pkg] = total.get(pkg, 0) + 1
         prev = last_active.get(pkg)
         if prev is not None and ts > prev:
@@ -554,6 +599,10 @@ def show_logs(con, query=None, limit=50, pkg_filter=None):
 
     keywords = [k.lower() for k in get_cfg(con, KEYWORD_KEY, [])]
     for ts, typ, pkg, data, child in rows:
+        # `data` is nullable in the local schema; older rows and hand-edited
+        # DBs can contain NULL, which used to raise AttributeError here and
+        # kill the whole log view.
+        data = data or ""
         flagged = any(k in data.lower() for k in keywords) if keywords else False
         line = f"  [{format_ts(ts)}] {pkg_name(pkg):18} {event_label(typ):16}"
         if flagged:
@@ -657,9 +706,13 @@ def manage_blocklist(con):
     elif choice == "r":
         try:
             idx = int(input("  number to remove: ").strip()) - 1
+            # Negative indexes silently remove entries from the end (0 -> last
+            # item); validate against the list bounds first.
+            if idx < 0 or idx >= len(bl):
+                raise ValueError("out of range")
             removed = bl.pop(idx)
             set_cfg(con, BLOCKLIST_KEY, bl)
-            print(green(f"  removed '{removed}'"))
+            print(green(f"  removed '{safe_text(removed)}'"))
         except Exception:
             print(red("  bad index"))
     else:
