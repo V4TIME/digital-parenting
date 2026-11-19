@@ -583,6 +583,11 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
     let last_event = incoming.last().cloned();
     let mut received = 0usize;
     for ev in incoming.iter().take(MAX_EVENTS) {
+        // A malformed batch can contain strings/numbers/arrays. Node skips
+        // them; storing one would inflate counts with an empty event.
+        if !ev.is_object() {
+            continue;
+        }
         let type_ = ev.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let package = ev.get("package").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let data = match ev.get("data") {
@@ -590,7 +595,14 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let raw_ts = ev.get("ts").and_then(|v| v.as_u64()).unwrap_or(now);
+        // A missing, null, zero, or non-integer ts means "now". Accepting 0
+        // would file the event at 1970 and corrupt ordering/screen time;
+        // Node rejects <= 0 the same way.
+        let raw_ts = ev
+            .get("ts")
+            .and_then(|v| v.as_u64())
+            .filter(|&t| t > 0)
+            .unwrap_or(now);
         // Sanitize the client-supplied timestamp so a tampered/clock-skewed
         // device cannot inject absurd future timestamps (false ordering).
         let ts = raw_ts.min(now.saturating_add(TS_FUTURE_ALLOWANCE_MS));
@@ -1265,6 +1277,36 @@ mod tests {
             assert_eq!(st.children.len(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_or_absent_timestamp_falls_back_to_now() {
+        let state = test_state("secret");
+        let before = now_ms();
+        let body = r#"{"childId":"cg_zero","events":[
+            {"type":"keylog","package":"p","data":"zero","ts":0},
+            {"type":"keylog","package":"p","data":"missing"},
+            "not-an-object",
+            42
+        ]}"#;
+        let (code, val) = handle_events(&state, body.as_bytes()).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(
+            val["received"].as_u64().unwrap(),
+            2,
+            "non-object entries must be skipped and ts=0 must be stored as now"
+        );
+        let after = now_ms();
+        let st = state.lock().unwrap();
+        assert_eq!(st.events.len(), 2);
+        for e in &st.events {
+            assert!(
+                e.ts >= before.saturating_sub(1_000),
+                "ts {} was filed in the past",
+                e.ts
+            );
+            assert!(e.ts <= after + TS_FUTURE_ALLOWANCE_MS);
+        }
     }
 
     #[test]

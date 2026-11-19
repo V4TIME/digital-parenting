@@ -77,6 +77,9 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-48 | low | Dashboard | Server sync inserted `ts`/`type`/`package`/`data`/`severity` as received. A malformed response (string/null timestamp) tripped the `INTEGER NOT NULL` constraint and the row was silently dropped. | `ev.get("ts", ...)` passed straight to sqlite | **Fixed 2026-11-18** — `_clean_ts` coerces to int, every text field is stringified, ids fall back to a hash; `test_sync_coerces_bad_types_from_server` asserts all stored columns are the right type |
 | F-49 | low | Dashboard | `compute_screen_durations` sorted rows by raw `ts`; a text/NULL timestamp in an old or hand-edited DB raised `TypeError` and blanked the screen-time view. | `sorted(rows, key=lambda r: r[3])` | **Fixed 2026-11-18** — rows are coerced and non-numeric ones skipped; `test_screen_time_skips_non_numeric_timestamps` |
 | F-50 | medium | Rust server | `load_state_from` trusted `state.json` completely: an oversized file was read whole, and arrays were loaded with no `MAX_EVENTS`/`MAX_ALERTS`/`MAX_CHILDREN` bound, defeating the caps enforced on the request path. | `fs::read(path)` then `for ev in arr` with no length check | **Fixed 2026-11-18** — 64 MiB file gate and newest-N slicing per array; `load_state_ignores_an_oversized_file` and `load_state_caps_arrays_to_the_live_limits` |
+| F-51 | medium | Both collectors | A malformed timestamp was filed at **epoch 0**. Node used `Number(ev.ts)` so `null`/`""` became `0`; Rust accepted an explicit `ts: 0`. That puts events first in every `ORDER BY ts` and, on the dashboard, first in screen-time ordering. | Node: `Number.isFinite(0)` is true → `ts = 0`; Rust: `as_u64()` returns `Some(0)` | **Fixed 2026-11-18** — both treat a missing, null, blank, or non-positive `ts` as `now()`; Node smoke asserts `ts > 1e12`, Rust test `zero_or_absent_timestamp_falls_back_to_now` |
+| F-52 | low | Node collector | At the child cap, `bumpChild` deleted the **first inserted** key, so a long-lived active child could be evicted while a stale one registered later stayed. Rust evicts least-recently-seen. | `state.children.keys().next().value` | **Fixed 2026-11-18** — evicts the smallest `lastSeen`; `CHILDGUARD_MAX_CHILDREN` makes the cap testable; smoke test registers A, B, touches A, registers C and asserts B (stale) is gone and A survives |
+| F-53 | low | Rust server | Non-object entries in `events` (strings, numbers, arrays) were stored as empty events (`type`/`package` empty, `data` empty), inflating counts. Node already skipped them. | loop body ran `ev.get(...)` on any JSON value | **Fixed 2026-11-18** — `if !ev.is_object() { continue; }`; the zero-timestamp test sends `"not-an-object"` and `42` and asserts `received == 2` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -448,13 +451,52 @@ android:   53 tests, 0 failures, 0 skipped (live collector)
 dashboard: python3 -m unittest termux/test_dashboard.py -> 12 tests, OK
 ```
 
+## 5g. Daily audit — 2026-11-18, collector-parity pass
+
+The Android app, Rust collector, and Node collector must agree on what a valid
+event is. This pass compared the two collectors' handling of malformed input
+and found three places where Node and Rust disagreed — and where one of them
+filed real data at 1970.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Timestamp zero | `null`/`""` (Node) or `0` (Rust) stored at epoch 0 | Treat missing/null/blank/non-positive as `now()` in both | Node smoke asserts `ts > 1e12`; Rust `zero_or_absent_timestamp_falls_back_to_now` |
+| Child eviction | Node evicted first-inserted, Rust least-recently-seen | Node now evicts smallest `lastSeen` | smoke: A touched, B stale, register C → B gone, A stays |
+| Non-object events | Rust stored `"x"`/`42` as empty events | Skip entries that are not JSON objects | same Rust test sends both and asserts two stored |
+
+Why these shapes:
+
+- **Two collectors must reject the same input.** A parent can run either one;
+  an event accepted by Node but dropped by Rust (or vice versa) makes the
+  README's "same behavior" claim false and makes sync results depend on the
+  backend.
+- **Epoch 0 is never a real device time.** A zero timestamp sorts before every
+  genuine event, so it silently rewrites the order a parent reads. Falling
+  back to `now()` preserves the event instead of dropping it and keeps order
+  honest.
+- **Evict by staleness, not by arrival.** The child map is bounded metadata;
+  evicting the oldest *insertion* punishes the child who has been monitored
+  longest. Both collectors now use `lastSeen`.
+
+Verification for this pass:
+
+```
+server:    cargo test --offline -> 20 passed; clippy -D warnings -> exit 0
+node:      node server/smoke_test.js ->
+           SMOKE OK: auth, token non-disclosure, dedupe, caps, ts coercion,
+           LRU eviction, stream limit, and liveness
+dashboard: python3 -m unittest termux/test_dashboard.py -> 12 tests, OK
+android:   53 tests, 0 failures, 0 skipped (unchanged by this pass)
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 19 passed; 0 failed
+server-rust:  cargo test            → 20 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
-              non-disclosure, dedupe, caps, stream limit, liveness)
+              non-disclosure, dedupe, caps, ts coercion, LRU eviction,
+              stream limit, liveness)
 android:      53 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,

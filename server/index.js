@@ -8,7 +8,12 @@ const AUTH_TOKEN = process.env.CHILDGUARD_TOKEN || crypto.randomBytes(24).toStri
 const MAX_BODY = 2 * 1024 * 1024;
 const MAX_EVENTS = 5000;
 const MAX_ALERTS = 500;
-const MAX_CHILDREN = 2000;
+// Env-overridable so the smoke test can exercise LRU eviction with two
+// children instead of registering 2,001 over HTTP.
+const MAX_CHILDREN = (() => {
+  const n = parseInt(process.env.CHILDGUARD_MAX_CHILDREN, 10);
+  return Number.isFinite(n) && n > 0 ? n : 2000;
+})();
 const MAX_DUPE_KEYS = 20000;
 const TS_FUTURE_ALLOWANCE_MS = 60 * 60 * 1000;
 // Cap SSE listeners the same way the Rust collector caps connections. One
@@ -79,8 +84,18 @@ function readBody(req, res, onBody) {
 
 function bumpChild(id, name) {
   if (state.children.size >= MAX_CHILDREN && !state.children.has(id)) {
-    const oldest = state.children.keys().next().value;
-    state.children.delete(oldest);
+    // Evict the least-recently-seen child, matching the Rust collector.
+    // Deleting the first key inserted would drop a long-lived active child
+    // while keeping a stale one that happened to register later.
+    let oldestId = null;
+    let oldestSeen = Infinity;
+    for (const [cid, c] of state.children) {
+      if (c.lastSeen < oldestSeen) {
+        oldestSeen = c.lastSeen;
+        oldestId = cid;
+      }
+    }
+    if (oldestId !== null) state.children.delete(oldestId);
   }
   const child = { id, name, lastSeen: now(), registeredAt: now() };
   state.children.set(id, child);
@@ -110,7 +125,10 @@ function addEvent(childId, ev) {
     ? ev.data
     : (ev.data == null ? '' : JSON.stringify(ev.data));
   const rawTs = Number(ev.ts);
-  const ts = Number.isFinite(rawTs)
+  // Number(null) and Number('') are 0, which would store the event at 1970
+  // and corrupt ordering/screen time. The Rust collector treats a missing or
+  // non-numeric ts as "now"; match that (and reject 0/negative epochs).
+  const ts = (Number.isFinite(rawTs) && rawTs > 0)
     ? Math.min(rawTs, now() + TS_FUTURE_ALLOWANCE_MS)
     : now();
 

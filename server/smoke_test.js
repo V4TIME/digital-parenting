@@ -16,6 +16,7 @@ const srv = spawn(process.execPath, [__dirname + '/index.js'], {
     PORT: String(PORT),
     CHILDGUARD_TOKEN: TOKEN,
     CHILDGUARD_MAX_STREAMS: '1', // exercise the cap with two connections
+    CHILDGUARD_MAX_CHILDREN: '2', // exercise LRU eviction with three children
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -112,6 +113,41 @@ function openStream() {
   assert.strictEqual(stats.code, 200, 'server died after oversized request');
   assert.strictEqual(JSON.parse(stats.body).totalEvents, 1);
 
+  // 7b. A null or blank device timestamp (Number(null) === 0) must not be
+  //     stored at epoch 0; that would corrupt ordering and screen time.
+  const nullTs = await request('POST', '/api/events', {
+    childId: 'cg_null_ts',
+    events: [
+      { type: 'keylog', package: 'p', data: 'null-ts', ts: null },
+      { type: 'keylog', package: 'p', data: 'blank-ts', ts: '' },
+    ],
+  });
+  assert.strictEqual(nullTs.code, 200, 'null-ts batch failed: ' + nullTs.body);
+  const allEvents = JSON.parse((await request('GET', '/api/events?limit=20')).body).events;
+  const coerced = allEvents.filter(e => e.data === 'null-ts' || e.data === 'blank-ts');
+  assert.strictEqual(coerced.length, 2, 'null/blank ts events were dropped');
+  for (const e of coerced) {
+    assert.ok(e.ts > 1_000_000_000_000, 'null/blank ts stored at epoch 0: ' + e.ts);
+  }
+
+  // 7c. With a two-child cap, the least-recently-seen child is evicted, not
+  //     the first inserted (which could be a long-lived active child).
+  const regA = JSON.parse((await request('POST', '/api/register', { name: 'A' })).body).childId;
+  await new Promise(r => setTimeout(r, 5));
+  const regB = JSON.parse((await request('POST', '/api/register', { name: 'B' })).body).childId;
+  await new Promise(r => setTimeout(r, 5));
+  // Touch A so its lastSeen is newer than B's.
+  await request('POST', '/api/events', {
+    childId: regA,
+    events: [{ type: 'keylog', package: 'p', data: 'touch-a', ts: Date.now() }],
+  });
+  await new Promise(r => setTimeout(r, 5));
+  const regC = JSON.parse((await request('POST', '/api/register', { name: 'C' })).body).childId;
+  const ids = JSON.parse((await request('GET', '/api/stats')).body).children.map(c => c.id);
+  assert.ok(ids.includes(regA), 'the recently-seen child was evicted');
+  assert.ok(ids.includes(regC), 'the new child was not added');
+  assert.ok(!ids.includes(regB), 'the stale child was not evicted');
+
   // 8. A user-supplied token must never be printed at startup.
   assert.ok(!serverOutput.includes(TOKEN), 'startup log leaked the user-supplied token');
 
@@ -129,7 +165,7 @@ function openStream() {
   assert.strictEqual(s3.code, 200, 'stream slot was not released on disconnect');
   s3.req.destroy();
 
-  console.log('SMOKE OK: auth, token non-disclosure, dedupe, caps, stream limit, and liveness');
+  console.log('SMOKE OK: auth, token non-disclosure, dedupe, caps, ts coercion, LRU eviction, stream limit, and liveness');
   srv.kill();
   process.exit(0);
 })().catch(e => {
