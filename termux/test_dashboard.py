@@ -259,6 +259,36 @@ class ConfigPermissionTest(unittest.TestCase):
                          dd.get_cfg(con, dd.BLOCKLIST_KEY, []))
         con.close()
 
+    def test_malformed_config_falls_back_to_defaults(self):
+        cfg_path = os.path.join(self.home, "config.json")
+        # Each of these parses as valid JSON but is not a config object; the
+        # old load_config returned it verbatim and every command crashed in
+        # cfg.get("...").
+        for payload in ("[]", "null", '"just-a-string"',
+                        '{"server": 5, "token": null}'):
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+            proc = run_dashboard(self.home, "--doctor")
+            self.assertNotIn(
+                "Traceback", proc.stderr,
+                f"malformed config {payload!r} crashed: {proc.stderr}",
+            )
+            # Defaults have an empty token, so the doctor stops at exit 5
+            # without touching the network.
+            self.assertEqual(5, proc.returncode, payload)
+
+    def test_doctor_sanitizes_untrusted_server_url(self):
+        cfg_path = os.path.join(self.home, "config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"server": "http://127.0.0.1:1/\x1b[2JEVIL", "token": "x"}, f)
+        proc = run_dashboard(self.home, "--doctor")
+        # The dashboard's own output uses SGR colour codes; strip those, then
+        # assert that the attacker-supplied clear-screen sequence is gone.
+        import re
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
+        self.assertNotIn("\x1b", plain, "control sequence reached the terminal")
+        self.assertNotIn("\x1b[2J", proc.stdout)
+
     def test_terminal_escape_sequences_are_neutralized(self):
         dd = self._load_dashboard()
         attacks = [

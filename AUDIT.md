@@ -80,6 +80,8 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-51 | medium | Both collectors | A malformed timestamp was filed at **epoch 0**. Node used `Number(ev.ts)` so `null`/`""` became `0`; Rust accepted an explicit `ts: 0`. That puts events first in every `ORDER BY ts` and, on the dashboard, first in screen-time ordering. | Node: `Number.isFinite(0)` is true → `ts = 0`; Rust: `as_u64()` returns `Some(0)` | **Fixed 2026-11-18** — both treat a missing, null, blank, or non-positive `ts` as `now()`; Node smoke asserts `ts > 1e12`, Rust test `zero_or_absent_timestamp_falls_back_to_now` |
 | F-52 | low | Node collector | At the child cap, `bumpChild` deleted the **first inserted** key, so a long-lived active child could be evicted while a stale one registered later stayed. Rust evicts least-recently-seen. | `state.children.keys().next().value` | **Fixed 2026-11-18** — evicts the smallest `lastSeen`; `CHILDGUARD_MAX_CHILDREN` makes the cap testable; smoke test registers A, B, touches A, registers C and asserts B (stale) is gone and A survives |
 | F-53 | low | Rust server | Non-object entries in `events` (strings, numbers, arrays) were stored as empty events (`type`/`package` empty, `data` empty), inflating counts. Node already skipped them. | loop body ran `ev.get(...)` on any JSON value | **Fixed 2026-11-18** — `if !ev.is_object() { continue; }`; the zero-timestamp test sends `"not-an-object"` and `42` and asserts `received == 2` |
+| F-54 | medium | Dashboard | A `config.json` that parses to a non-object (`[]`, `null`, `"text"`, or `{"server": 5, "token": null}`) made **every** command crash with `AttributeError: 'list' object has no attribute 'get'`, including `--doctor` and `--sync`. | `return json.load(f)` with no shape check | **Fixed 2026-11-18** — `load_config` accepts only a dict and coerces `server`/`token` to strings; `test_malformed_config_falls_back_to_defaults` runs four shapes and asserts no traceback |
+| F-55 | medium | Dashboard | `--doctor` printed the parent-typed server URL raw, and the server-supplied `service` field raw, so an ESC sequence in either could clear the screen or rewrite the parent's terminal. The interactive `configure` prompt echoed the stored URL raw too. | `print(f"    server : {url}")`; `dim(f" (service={health.get('service')})")`; `input(f" ... [{cfg.get('server')}]: ")` | **Fixed 2026-11-18** — `safe_text()` on the URL, service, exception text, and configure prompt; `test_doctor_sanitizes_untrusted_server_url` asserts the clear-screen sequence is gone |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -489,6 +491,33 @@ dashboard: python3 -m unittest termux/test_dashboard.py -> 12 tests, OK
 android:   53 tests, 0 failures, 0 skipped (unchanged by this pass)
 ```
 
+## 5h. Daily audit — 2026-11-18, config-robustness pass
+
+The dashboard is the parent's only window into the data, so it must not be
+taken down by its own config file or by a hostile server. This pass drove both
+cases directly.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Config shape | `[]`/`null`/string config crashed every command in `cfg.get` | Validate dict, coerce `server`/`token` to strings | `test_malformed_config_falls_back_to_defaults` (4 shapes) |
+| Doctor output | URL, server `service`, and exception text printed raw | `safe_text()` at each print | `test_doctor_sanitizes_untrusted_server_url` |
+| Configure prompt | Stored URL echoed raw into the prompt | `safe_text()` in the prompt | same sanitizer, covered by the test above |
+
+Why these shapes:
+
+- **A bad config should degrade, not brick.** The token can always be
+  re-entered; the command should fall back to defaults and tell the parent,
+  not raise into a traceback they cannot act on.
+- **The server is not trusted input.** Even a server the parent chose can be
+  compromised or misconfigured. Any string it returns that reaches a terminal
+  goes through the same sanitizer as captured chat text.
+
+Verification for this pass:
+
+```
+dashboard: python3 -m unittest termux/test_dashboard.py -> 14 tests, OK
+```
+
 ## 6. Verification log (this audit)
 
 ```
@@ -503,7 +532,7 @@ android:      53 tests, 0 failures, 0 skipped (with live server)
               Feature3Notification 10, Feature1ServerE2E 4, UploadBatching 6,
               DashboardActivity 2, MonitorServiceLifecycle 4,
               WebMonitorActivity 1
-dashboard:    python3 -m unittest termux/test_dashboard.py → 12 passed
+dashboard:    python3 -m unittest termux/test_dashboard.py → 14 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
               sha256 7dabac98...e4eec7ba
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);

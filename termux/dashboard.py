@@ -159,12 +159,25 @@ def ensure_env():
 # Config helpers
 # --------------------------------------------------------------------------
 def load_config():
+    """Return a dict with string `server`/`token`.
+
+    A truncated, hand-edited, or wrong-version config.json can parse to `[]`,
+    `null`, or a string. Returning that verbatim made every command crash with
+    `AttributeError: 'list' object has no attribute 'get'`. Validate the shape
+    and coerce the two fields the rest of the program relies on.
+    """
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
-            pass
+            data = None
+        if isinstance(data, dict):
+            if not isinstance(data.get("server"), str):
+                data["server"] = DEFAULT_SERVER
+            if not isinstance(data.get("token"), str):
+                data["token"] = DEFAULT_TOKEN
+            return data
     return {"server": DEFAULT_SERVER, "token": DEFAULT_TOKEN}
 
 
@@ -264,7 +277,7 @@ def run_doctor(cfg, timeout=5):
     token = cfg.get("token") or DEFAULT_TOKEN
 
     print(bold("  Connection doctor"))
-    print(f"    server : {url}")
+    print(f"    server : {safe_text(url)}")
     if token:
         print(f"    token  : set ({len(token)} chars)")
     else:
@@ -279,14 +292,14 @@ def run_doctor(cfg, timeout=5):
         print("    health : " + red(f"FAILED (HTTP {e.code})"))
         return 2
     except Exception as e:
-        print("    health : " + red(f"FAILED ({e})"))
+        print("    health : " + red(f"FAILED ({safe_text(e)})"))
         print(dim("             check the URL, that the collector is running, and the tailnet"))
         return 2
 
     if not isinstance(health, dict) or not health.get("ok"):
         print("    health : " + red(f"unexpected response {health!r}"))
         return 4
-    print("    health : " + green("OK") + dim(f" (service={health.get('service', '?')})"))
+    print("    health : " + green("OK") + dim(f" (service={safe_text(health.get('service', '?'))})"))
 
     # 2. Authenticated read: proves the parent token, not just reachability.
     try:
@@ -298,7 +311,7 @@ def run_doctor(cfg, timeout=5):
         print("    auth   : " + red(f"FAILED (HTTP {e.code})"))
         return 2
     except Exception as e:
-        print("    auth   : " + red(f"FAILED ({e})"))
+        print("    auth   : " + red(f"FAILED ({safe_text(e)})"))
         return 2
 
     if not isinstance(stats, dict):
@@ -334,7 +347,7 @@ def sync_from_server(con, cfg, verbose=True):
         al_resp = http_get_json(f"{url}/api/alerts?limit=500", token)
     except Exception as e:
         if verbose:
-            print(red(f"Sync failed: {e}"))
+            print(red(f"Sync failed: {safe_text(e)}"))
         return 0
 
     def _clean_id(obj, prefix):
@@ -725,7 +738,7 @@ def configure(con):
     print(banner())
     print()
     print(bold("  Configure connection"))
-    cur = input(f"  server URL [{cfg.get('server', DEFAULT_SERVER)}]: ").strip()
+    cur = input(f"  server URL [{safe_text(cfg.get('server', DEFAULT_SERVER))}]: ").strip()
     if cur:
         cfg["server"] = cur.rstrip("/")
     current_token = cfg.get("token", "")
