@@ -26,7 +26,7 @@
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
 > dashboard. The full suite is **54 tests, 0 failures, 0 skipped** against a
-> live collector, plus 20 collector tests and 14 dashboard regression tests.
+> live collector, plus 24 collector tests and 14 dashboard regression tests.
 > Remaining work is a run on a physical phone; no Android device or KVM is
 > available in the build environment.
 
@@ -177,7 +177,7 @@ method are in [`AUDIT.md`](AUDIT.md) and [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 
 | Layer | Command | Last result |
 |---|---|---|
-| Collector unit tests | `cargo test --offline` | **20 passed, 0 failed** |
+| Collector unit tests | `cargo test --offline` | **24 passed, 0 failed** |
 | Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **14 passed, 0 failed** |
 | Collector lints | `cargo clippy --offline -- -D warnings` | **exit 0** |
 | Legacy collector | `node server/smoke_test.js` | **SMOKE OK** |

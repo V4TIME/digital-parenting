@@ -14,7 +14,7 @@
 //!
 //! Security posture:
 //!   - bearer token checked in constant time
-//!   - body size cap, header line cap, per-connection timeout
+//!   - body size cap, header line cap, total request deadline
 //!   - non-UTF8 / malformed JSON rejected with 400
 //!   - bounded in-memory state (events/alerts capped)
 //!   - bounded concurrent connections
@@ -49,6 +49,14 @@ const MAX_STATE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 /// How often dirty state is flushed to disk. Writes used to happen inline on
 /// every request, which made the collector disk-bound (~8 req/s).
 const PERSIST_INTERVAL_MS: u64 = 2_000;
+/// Total wall-clock budget for reading one request (headers + body). The
+/// per-read timeout alone does not stop a slowloris that sends one byte just
+/// before each 30 s deadline; this bounds how long one of the 256 connection
+/// slots can be held.
+const MAX_REQUEST_TIME: Duration = Duration::from_secs(30);
+/// Ceiling for a single `read`. The effective timeout is the smaller of this
+/// and whatever is left of the request budget.
+const PER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const TS_FUTURE_ALLOWANCE_MS: u64 = 3_600_000; // accept client clocks up to 1h ahead
 const STATE_DIR_ENV: &str = "CHILDGUARD_DATA_DIR";
 
@@ -302,6 +310,7 @@ fn write_html_response(
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -371,16 +380,73 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request, u16> {
+    read_request_with_budget(stream, MAX_REQUEST_TIME)
+}
+
+/// Arm the socket read timeout with whatever is left of the request budget.
+///
+/// A fixed 30 s socket timeout equal to the total budget is not a bound: the
+/// read returns `WouldBlock` at 30 s and used to be mapped to a 400, while a
+/// peer that dribbles a byte just before each expiry could hold a connection
+/// slot forever. Re-arming with `remaining` makes the deadline authoritative
+/// and lets a timed-out read be reported as 408.
+fn arm_read_timeout(stream: &TcpStream, started: std::time::Instant, budget: Duration) -> Result<(), u16> {
+    let remaining = budget.checked_sub(started.elapsed()).unwrap_or_default();
+    if remaining.is_zero() {
+        return Err(408);
+    }
+    let _ = stream.set_read_timeout(Some(remaining.min(PER_READ_TIMEOUT)));
+    Ok(())
+}
+
+fn is_read_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// What one `read` call means for the request loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadStep {
+    Data(usize),
+    Eof,
+    /// A signal interrupted the read. POSIX says to retry; treating it as a
+    /// protocol error killed legitimate requests at random.
+    Interrupted,
+    Timeout,
+    Fatal,
+}
+
+fn read_step(result: std::io::Result<usize>) -> ReadStep {
+    match result {
+        Ok(0) => ReadStep::Eof,
+        Ok(n) => ReadStep::Data(n),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => ReadStep::Interrupted,
+        Err(e) if is_read_timeout(&e) => ReadStep::Timeout,
+        Err(_) => ReadStep::Fatal,
+    }
+}
+
+/// Read one request, giving up after `budget`. Split out from [read_request]
+/// so a unit test can exercise the deadline with a short budget instead of
+/// waiting 30 s.
+fn read_request_with_budget(stream: &mut TcpStream, budget: Duration) -> Result<Request, u16> {
+    let started = std::time::Instant::now();
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
     // Track where we last scanned so we don't re-scan the whole buffer on
     // every read (avoids O(n^2) CPU on slow/large requests).
     let mut scanned_up_to = 0usize;
     loop {
-        let n = stream.read(&mut tmp).map_err(|_| 400u16)?;
-        if n == 0 {
-            break;
-        }
+        arm_read_timeout(stream, started, budget)?;
+        let n = match read_step(stream.read(&mut tmp)) {
+            ReadStep::Data(n) => n,
+            ReadStep::Eof => break,
+            ReadStep::Interrupted => continue,
+            ReadStep::Timeout => return Err(408),
+            ReadStep::Fatal => return Err(400),
+        };
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > MAX_BODY + 65_536 {
             return Err(413);
@@ -429,10 +495,14 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, u16> {
         return Err(413);
     }
     while body.len() < cl {
-        let n = stream.read(&mut tmp).map_err(|_| 400u16)?;
-        if n == 0 {
-            break;
-        }
+        arm_read_timeout(stream, started, budget)?;
+        let n = match read_step(stream.read(&mut tmp)) {
+            ReadStep::Data(n) => n,
+            ReadStep::Eof => break,
+            ReadStep::Interrupted => continue,
+            ReadStep::Timeout => return Err(408),
+            ReadStep::Fatal => return Err(400),
+        };
         body.extend_from_slice(&tmp[..n]);
         if body.len() > MAX_BODY {
             return Err(413);
@@ -877,7 +947,12 @@ fn main() {
             let req = match read_request(&mut conn) {
                 Ok(r) => r,
                 Err(status) => {
-                    json_response(&mut conn, status, &serde_json::json!({ "error": "bad request" }));
+                    let msg = match status {
+                        408 => "request timeout",
+                        413 => "payload too large",
+                        _ => "bad request",
+                    };
+                    json_response(&mut conn, status, &serde_json::json!({ "error": msg }));
                     return;
                 }
             };
@@ -919,6 +994,7 @@ fn main() {
                 Err(status) => {
                     let msg = match status {
                         404 => "not found",
+                        408 => "request timeout",
                         413 => "payload too large",
                         _ => "bad request",
                     };
@@ -1307,6 +1383,104 @@ mod tests {
             );
             assert!(e.ts <= after + TS_FUTURE_ALLOWANCE_MS);
         }
+    }
+
+    /// Build a connected pair and hand the server side to the reader. The
+    /// client writes whatever partial request the test needs and then blocks
+    /// reading until the server drops the socket, so it can never send an
+    /// early EOF and turn a timeout into a 400 by accident.
+    fn with_stalled_client<F>(write: F, budget: Duration) -> (Result<Request, u16>, Duration)
+    where
+        F: FnOnce(&mut TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            write(&mut s);
+            let _ = s.flush();
+            // Block until the server closes; never half-close early.
+            let mut b = [0u8; 1];
+            let _ = s.read(&mut b);
+        });
+        let (mut server_side, _) = listener.accept().unwrap();
+        let started = std::time::Instant::now();
+        let result = read_request_with_budget(&mut server_side, budget);
+        let elapsed = started.elapsed();
+        drop(server_side);
+        client.join().unwrap();
+        (result, elapsed)
+    }
+
+    #[test]
+    fn read_step_retries_eintr_and_classifies_timeouts() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(read_step(Ok(0)), ReadStep::Eof);
+        assert_eq!(read_step(Ok(7)), ReadStep::Data(7));
+        // A signal during a blocking read must not fail the request.
+        assert_eq!(
+            read_step(Err(Error::from(ErrorKind::Interrupted))),
+            ReadStep::Interrupted
+        );
+        // Socket read timeouts are a 408, not a bad request.
+        assert_eq!(
+            read_step(Err(Error::from(ErrorKind::WouldBlock))),
+            ReadStep::Timeout
+        );
+        assert_eq!(
+            read_step(Err(Error::from(ErrorKind::TimedOut))),
+            ReadStep::Timeout
+        );
+        assert_eq!(
+            read_step(Err(Error::from(ErrorKind::ConnectionReset))),
+            ReadStep::Fatal
+        );
+    }
+
+    #[test]
+    fn slow_headers_hit_the_deadline_and_return_408() {
+        let (result, elapsed) = with_stalled_client(
+            |s| {
+                s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+                    .unwrap();
+            },
+            Duration::from_millis(250),
+        );
+        assert_eq!(Some(408), result.err(), "slow headers must be a timeout");
+        assert!(elapsed >= Duration::from_millis(150), "returned early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "deadline overshot: {elapsed:?}");
+    }
+
+    #[test]
+    fn slow_body_hit_the_deadline_and_return_408() {
+        let (result, elapsed) = with_stalled_client(
+            |s| {
+                s.write_all(b"POST /api/events HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\na")
+                    .unwrap();
+            },
+            Duration::from_millis(250),
+        );
+        assert_eq!(Some(408), result.err(), "slow body must be a timeout");
+        assert!(elapsed >= Duration::from_millis(150), "returned early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "deadline overshot: {elapsed:?}");
+    }
+
+    #[test]
+    fn complete_request_is_parsed_within_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"POST /api/events HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            let _ = s.shutdown(std::net::Shutdown::Write);
+        });
+        let (mut server_side, _) = listener.accept().unwrap();
+        let req = read_request_with_budget(&mut server_side, Duration::from_secs(2)).unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/api/events");
+        assert_eq!(req.body, b"{}".to_vec());
+        client.join().unwrap();
     }
 
     #[test]

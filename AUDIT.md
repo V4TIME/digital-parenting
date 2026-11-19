@@ -83,6 +83,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-54 | medium | Dashboard | A `config.json` that parses to a non-object (`[]`, `null`, `"text"`, or `{"server": 5, "token": null}`) made **every** command crash with `AttributeError: 'list' object has no attribute 'get'`, including `--doctor` and `--sync`. | `return json.load(f)` with no shape check | **Fixed 2026-11-18** — `load_config` accepts only a dict and coerces `server`/`token` to strings; `test_malformed_config_falls_back_to_defaults` runs four shapes and asserts no traceback |
 | F-55 | medium | Dashboard | `--doctor` printed the parent-typed server URL raw, and the server-supplied `service` field raw, so an ESC sequence in either could clear the screen or rewrite the parent's terminal. The interactive `configure` prompt echoed the stored URL raw too. | `print(f"    server : {url}")`; `dim(f" (service={health.get('service')})")`; `input(f" ... [{cfg.get('server')}]: ")` | **Fixed 2026-11-18** — `safe_text()` on the URL, service, exception text, and configure prompt; `test_doctor_sanitizes_untrusted_server_url` asserts the clear-screen sequence is gone |
 | F-56 | medium | Android | The notification listener read `EXTRA_TITLE`/`EXTRA_TEXT`/`EXTRA_BIG_TEXT` with no length cap and queued them raw. A chat app controls those fields; 200 queued notifications could hold hundreds of MB. Feature 1 already capped at 500 chars. | `extras.getCharSequence(...)?.toString()` passed straight into the queue | **Fixed 2026-11-19** — each field and `combined` capped at 500; `notificationTextIsBounded` posts 200,000 chars and asserts title/text/combined are ≤ 500 |
+| F-57 | high | Rust server | Two bugs in request reading. (a) The 30 s socket read timeout equalled the total request budget and a timeout was mapped to `400`, so a slowloris that dribbled a byte just before each expiry could hold one of the 256 slots **indefinitely**, and a merely stalled client saw `400 Bad Request` instead of `408`. (b) `ErrorKind::Interrupted` (EINTR) was also mapped to `400`: an ordinary signal delivery killed a legitimate in-flight request at a random moment (reproduced at 0.6 s, 3.1 s and 24.2 s). | `stream.read(...).map_err(\|_\| 400u16)?` plus a fixed `SO_RCVTIMEO` of 30 s | **Fixed 2026-11-19** — the read timeout is re-armed from the remaining budget before every read, timeout ⇒ `408`, and EINTR is retried; `read_step_retries_eintr_and_classifies_timeouts` plus two socket tests on a 250 ms budget; live probe: trickle 1 B/2 s → `408` at 30.03 s, partial headers → `408` at 30.20 s, partial body → `408` at 30.20 s |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -547,10 +548,43 @@ apk:       7,400,089 bytes, sha256 57e69efd...a6253ea
 server:    Rust 20, Node smoke, dashboard 14 unchanged and green
 ```
 
+## 5j. Daily audit — 2026-11-19, request-deadline pass
+
+The collector accepts one thread per connection (up to 256). The per-read
+timeout was meant to bound those threads, but two details defeated it.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Total deadline | Socket timeout = total budget, and expiry mapped to `400` | Re-arm `SO_RCVTIMEO` from `budget - elapsed` before each read; expiry ⇒ `408` | two socket tests at a 250 ms budget |
+| EINTR | `Interrupted` mapped to `400` | Retry the read (POSIX), re-checking the budget | `read_step_retries_eintr_and_classifies_timeouts` |
+| Probe | — | — | live: 408 at 30.03 s (trickle), 30.20 s (headers), 30.20 s (body); complete request 200 in 0.00 s |
+
+Why these shapes:
+
+- **A deadline the peer can extend is not a deadline.** Re-arming from the
+  remaining budget means the *last* read can never outlive the budget, no
+  matter how the peer paces its bytes.
+- **408 is a different fact from 400.** A stalled request is not malformed;
+  the status tells the parent (and logs) that the network or client is slow,
+  not that the payload was bad.
+- **EINTR is not a protocol error.** `read_step` now separates "try again"
+  from "timeout" from "fatal", and is unit-tested without sending signals.
+
+Probe against the final release binary:
+
+```
+slowloris 1B/2s    -> 30.03s  HTTP/1.1 408 Request Timeout
+partial headers    -> 31.77s  HTTP/1.1 408 Request Timeout  {"error":"request timeout"}
+partial body       -> 30.20s  HTTP/1.1 408 Request Timeout
+oversized body     ->  0.00s  HTTP/1.1 413 Payload Too Large {"error":"payload too large"}
+complete request   ->  0.00s  HTTP/1.1 200 OK
+health after       -> {"ok":true,...}   (server still serving)
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 20 passed; 0 failed
+server-rust:  cargo test            → 24 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, ts coercion, LRU eviction,
