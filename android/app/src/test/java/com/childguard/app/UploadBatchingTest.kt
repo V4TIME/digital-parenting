@@ -3,6 +3,7 @@ package com.childguard.app
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -88,13 +89,20 @@ class UploadBatchingTest {
     }
 
     @Test
-    fun serverUrlIsTrimmedAndHasNoDoubleSlash() {
+    fun serverUrlIsNormalizedAndMustBeHttp() {
         assertEquals(
             "http://100.64.0.2:38080",
-            MonitorService.normalizeServerUrl("  http://100.64.0.2:38080///  ")
+            MonitorService.normalizeHttpUrl("  http://100.64.0.2:38080///  ")
         )
-        assertEquals("https://cg.example", MonitorService.normalizeServerUrl("https://cg.example/"))
-        assertEquals("", MonitorService.normalizeServerUrl("   "))
+        assertEquals("https://cg.example", MonitorService.normalizeHttpUrl("https://cg.example/"))
+        // A scheme is filled in: "host:port" is what parents actually type.
+        assertEquals(
+            "http://cg.example:38080",
+            MonitorService.normalizeHttpUrl("cg.example:38080")
+        )
+        assertNull(MonitorService.normalizeHttpUrl("   "))
+        assertNull(MonitorService.normalizeHttpUrl("ftp://cg.example"))
+        assertNull(MonitorService.normalizeHttpUrl("http://"))
     }
 
     @Test

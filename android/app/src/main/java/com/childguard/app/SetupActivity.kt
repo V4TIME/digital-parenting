@@ -36,9 +36,22 @@ class SetupActivity : AppCompatActivity() {
 
         btnFinish.setOnClickListener {
             val server = editServer.text?.toString()?.trim().orEmpty()
+                .ifEmpty { ChildGuardApp.DEFAULT_SERVER }
             val token = editToken.text?.toString()?.trim().orEmpty()
+            // A host typed without a scheme used to be saved verbatim, and
+            // URL(...) then failed on every upload with no visible error.
+            val normalized = MonitorService.normalizeHttpUrl(server)
+            if (normalized == null) {
+                editServer.error = "Use an http:// or https:// address"
+                Toast.makeText(
+                    this,
+                    "Server URL must be an http:// or https:// address",
+                    Toast.LENGTH_LONG
+                ).show()
+                return@setOnClickListener
+            }
             prefs.edit()
-                .putString(ChildGuardApp.KEY_SERVER_URL, server.ifEmpty { ChildGuardApp.DEFAULT_SERVER })
+                .putString(ChildGuardApp.KEY_SERVER_URL, normalized)
                 .putString(ChildGuardApp.KEY_PARENT_TOKEN, token)
                 .putBoolean("setup_done", true)
                 .apply()

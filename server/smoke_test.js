@@ -148,6 +148,35 @@ function openStream() {
   assert.ok(ids.includes(regC), 'the new child was not added');
   assert.ok(!ids.includes(regB), 'the stale child was not evicted');
 
+  // 7d. Oversized field values are clipped before storage. Without this,
+  //     5,000 events (or 2,000 children) of near-2 MiB strings pin gigabytes
+  //     of RSS; /api/export then allocates that again.
+  const bigBatch = {
+    childId: 'c'.repeat(10_000),
+    events: [{
+      type: 't'.repeat(5_000),
+      package: 'p'.repeat(5_000),
+      data: 'é'.repeat(10_000),
+      ts: Date.now(),
+    }],
+  };
+  const bigFields = await request('POST', '/api/events', bigBatch);
+  assert.strictEqual(bigFields.code, 200, 'oversized fields rejected: ' + bigFields.body);
+  const clipped = JSON.parse((await request('GET', '/api/events?limit=5')).body)
+    .events.find(e => e.data.startsWith('é'));
+  assert.ok(clipped, 'clipped event was not stored');
+  assert.ok(Buffer.byteLength(clipped.data, 'utf8') <= 8 * 1024,
+    'data kept ' + Buffer.byteLength(clipped.data, 'utf8') + ' bytes');
+  assert.ok(Buffer.byteLength(clipped.type, 'utf8') <= 64,
+    'type kept ' + Buffer.byteLength(clipped.type, 'utf8') + ' bytes');
+  assert.ok(Buffer.byteLength(clipped.package, 'utf8') <= 128,
+    'package kept ' + Buffer.byteLength(clipped.package, 'utf8') + ' bytes');
+  assert.ok(Buffer.byteLength(clipped.childId, 'utf8') <= 128,
+    'childId kept ' + Buffer.byteLength(clipped.childId, 'utf8') + ' bytes');
+  const retry = await request('POST', '/api/events', bigBatch);
+  assert.strictEqual(JSON.parse(retry.body).received, 0,
+    'clipped retry was counted twice');
+
   // 8. A user-supplied token must never be printed at startup.
   assert.ok(!serverOutput.includes(TOKEN), 'startup log leaked the user-supplied token');
 
@@ -165,7 +194,7 @@ function openStream() {
   assert.strictEqual(s3.code, 200, 'stream slot was not released on disconnect');
   s3.req.destroy();
 
-  console.log('SMOKE OK: auth, token non-disclosure, dedupe, caps, ts coercion, LRU eviction, stream limit, and liveness');
+  console.log('SMOKE OK: auth, token non-disclosure, dedupe, caps, ts coercion, LRU eviction, field clipping, stream limit, and liveness');
   srv.kill();
   process.exit(0);
 })().catch(e => {

@@ -16,6 +16,7 @@ Two layers of proof, plus the small part that needs a real phone.
 | `DashboardActivityTest` (2) | **"Monitoring: ON" actually starts `MonitorService`** (first-run flow), and OFF does not | Robolectric API 34 |
 | `MonitorServiceLifecycleTest` (4) | explicit STOP is not sticky; a null-intent system restart resumes or stops cleanly | Robolectric API 34 |
 | `WebMonitorActivityTest` (1) | the internet-app scan lists a real `INTERNET` app via one `getInstalledPackages` call, off the UI thread | Robolectric API 34 |
+| `SetupActivityTest` (2) | a scheme-less URL is saved as `http://…`; a non-http URL shows an inline error and does not replace the saved endpoint | Robolectric API 34 |
 
 ```bash
 cd android
@@ -32,7 +33,7 @@ CHILDGUARD_SERVER=http://127.0.0.1:38080 CHILDGUARD_TOKEN=testsecret \
   gradle :app:cleanTestDebugUnitTest :app:testDebugUnitTest --tests "*Feature1ServerE2ETest"
 ```
 
-Last run: **54 tests, 0 failures, 0 skipped** (live collector; the 4 E2E tests
+Last run: **56 tests, 0 failures, 0 skipped** (live collector; the 4 E2E tests
 skip when no server is configured).
 
 ### What `Feature1RuntimeTest` drives

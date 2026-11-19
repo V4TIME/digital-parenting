@@ -42,6 +42,19 @@ const MAX_CHILDREN: usize = 2000;
 const MAX_CONNECTIONS: usize = 256;
 const SSE_HEARTBEAT_SECS: u64 = 25;
 const MAX_DUPE_KEYS: usize = 20_000;
+/// Field caps. The 2 MiB body limit bounds one request, not the stored state:
+/// 5,000 events (or 2,000 children) of near-2 MiB strings would pin gigabytes
+/// of RSS and make `/api/export` allocate that again. The Android client sends
+/// at most a few hundred bytes per field, so these caps are far above real
+/// data while keeping worst-case memory in the tens of MiB.
+const MAX_ID_BYTES: usize = 128;
+const MAX_TYPE_BYTES: usize = 64;
+const MAX_PACKAGE_BYTES: usize = 128;
+const MAX_DATA_BYTES: usize = 8 * 1024;
+const MAX_CHILD_NAME_BYTES: usize = 128;
+/// SSE streams are long-lived threads; cap them separately from the general
+/// connection limit so 64 idle dashboards cannot occupy every request slot.
+const MAX_SSE: usize = 64;
 /// Upper bound on the persisted state file accepted at startup. The live caps
 /// already limit what this process writes; this protects against a corrupt or
 /// hand-edited file that would otherwise be read and re-serialized in full.
@@ -379,6 +392,19 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
+/// Truncate to at most `max_bytes` without splitting a UTF-8 character.
+/// Client-supplied strings are otherwise bounded only by the 2 MiB body cap.
+fn clip(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<Request, u16> {
     read_request_with_budget(stream, MAX_REQUEST_TIME)
 }
@@ -576,6 +602,7 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Child".to_string());
+    let name = clip(&name, MAX_CHILD_NAME_BYTES);
     let id = uid("cg");
     let now = now_ms();
     let mut st = lock_state(state);
@@ -616,14 +643,16 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
         return Err(413);
     }
     let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|_| 400u16)?;
-    let child_id = parsed
+    let child_id_raw = parsed
         .get("childId")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if child_id.is_empty() {
+    if child_id_raw.is_empty() {
         return Err(400);
     }
+    // Cap the id before it becomes a map key and part of the dedupe hash.
+    let child_id = clip(&child_id_raw, MAX_ID_BYTES);
 
     // Borrow the parsed events instead of deep-cloning the array. A 5,000
     // event batch used to allocate a second full copy before doing any work.
@@ -658,11 +687,17 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
         if !ev.is_object() {
             continue;
         }
-        let type_ = ev.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-        let package = ev.get("package").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let type_ = clip(
+            ev.get("type").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            MAX_TYPE_BYTES,
+        );
+        let package = clip(
+            ev.get("package").and_then(|v| v.as_str()).unwrap_or(""),
+            MAX_PACKAGE_BYTES,
+        );
         let data = match ev.get("data") {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(v) => v.to_string(),
+            Some(serde_json::Value::String(s)) => clip(s, MAX_DATA_BYTES),
+            Some(v) => clip(&v.to_string(), MAX_DATA_BYTES),
             None => String::new(),
         };
         // A missing, null, zero, or non-integer ts means "now". Accepting 0
@@ -824,6 +859,16 @@ fn handle_export(state: &Arc<Mutex<AppState>>) -> (u16, serde_json::Value) {
 // ---------------------------------------------------------------------------
 // SSE handler (streaming)
 // ---------------------------------------------------------------------------
+/// Register one SSE listener if there is room. Returns false when the cap is
+/// reached; the caller then answers 503 instead of pinning a thread.
+fn add_sse_client(st: &mut AppState, id: String, tx: mpsc::SyncSender<String>) -> bool {
+    if st.sse.len() >= MAX_SSE {
+        return false;
+    }
+    st.sse.push((id, tx));
+    true
+}
+
 fn handle_sse(
     state: &Arc<Mutex<AppState>>,
     mut conn: TcpStream,
@@ -832,7 +877,15 @@ fn handle_sse(
     let (tx, rx) = mpsc::sync_channel::<String>(64);
     {
         let mut st = lock_state(state);
-        st.sse.push((id.clone(), tx));
+        if !add_sse_client(&mut st, id.clone(), tx) {
+            drop(st);
+            json_response(
+                &mut conn,
+                503,
+                &serde_json::json!({ "error": "too many stream clients" }),
+            );
+            return;
+        }
     }
     let _ = conn.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
@@ -1481,6 +1534,66 @@ mod tests {
         assert_eq!(req.path, "/api/events");
         assert_eq!(req.body, b"{}".to_vec());
         client.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_fields_are_clipped_before_storage() {
+        let state = test_state("secret");
+        let body = format!(r#"{{"name":"{}"}}"#, "n".repeat(10_000));
+        let (code, val) = handle_register(&state, body.as_bytes()).unwrap();
+        assert_eq!(code, 200);
+        let id = val["childId"].as_str().unwrap().to_string();
+        {
+            let st = state.lock().unwrap();
+            let child = st.children.get(&id).unwrap();
+            assert!(
+                child.name.len() <= MAX_CHILD_NAME_BYTES,
+                "name kept {} bytes",
+                child.name.len()
+            );
+        }
+
+        // Multi-byte data so clipping at a byte boundary would panic or
+        // produce invalid UTF-8 if the helper were wrong.
+        let batch = serde_json::json!({
+            "childId": "c".repeat(10_000),
+            "events": [{
+                "type": "t".repeat(5_000),
+                "package": "p".repeat(5_000),
+                "data": "é".repeat(10_000),
+            }],
+        });
+        let (code, val) =
+            handle_events(&state, serde_json::to_vec(&batch).unwrap().as_slice()).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(val["received"].as_u64().unwrap(), 1);
+        let st = state.lock().unwrap();
+        let stored = st.events.back().unwrap();
+        assert_eq!(stored.child.len(), MAX_ID_BYTES, "childId not clipped");
+        assert_eq!(stored.type_.len(), MAX_TYPE_BYTES, "type not clipped");
+        assert_eq!(stored.package.len(), MAX_PACKAGE_BYTES, "package not clipped");
+        assert!(stored.data.len() <= MAX_DATA_BYTES, "data kept {} bytes", stored.data.len());
+        assert_eq!(stored.data.len() % 2, 0, "clip split a UTF-8 character");
+        assert!(stored.data.chars().all(|c| c == 'é'));
+        assert!(st.children.contains_key(&stored.child));
+    }
+
+    #[test]
+    fn sse_cap_rejects_clients_beyond_the_limit() {
+        let state = test_state("secret");
+        let mut keep = Vec::new();
+        let mut st = state.lock().unwrap();
+        for i in 0..MAX_SSE {
+            let (tx, rx) = mpsc::sync_channel(1);
+            assert!(add_sse_client(&mut st, format!("s{i}"), tx));
+            keep.push(rx);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(!add_sse_client(&mut st, "overflow".to_string(), tx));
+        keep.push(rx);
+        assert_eq!(st.sse.len(), MAX_SSE);
+        drop(st);
+        drop(keep);
     }
 
     #[test]

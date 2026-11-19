@@ -62,9 +62,26 @@ class MonitorService : Service() {
             return (UPLOAD_INTERVAL_MS shl shift).coerceAtMost(MAX_BACKOFF_MS)
         }
 
-        /** One source of truth for the endpoint base, so a saved trailing
-         * slash cannot produce `//api/events`. */
-        internal fun normalizeServerUrl(raw: String): String = raw.trim().trimEnd('/')
+        /** Normalize a parent-typed URL and require an http(s) endpoint.
+         *
+         * `URL("192.168.1.5:38080")` throws "unknown protocol", and the
+         * monitor swallowed that on every pass, so an address entered without
+         * a scheme produced no uploads and no visible error. Fill in http://
+         * when the scheme is missing and reject anything not http(s). */
+        internal fun normalizeHttpUrl(raw: String): String? {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return null
+            val withScheme = if ("://" in trimmed) trimmed else "http://$trimmed"
+            val url = try {
+                java.net.URL(withScheme)
+            } catch (e: Exception) {
+                return null
+            }
+            val scheme = url.protocol?.lowercase()
+            if (scheme != "http" && scheme != "https") return null
+            if (url.host.isNullOrBlank()) return null
+            return withScheme.trimEnd('/')
+        }
 
         var isMonitoring = false
             private set
@@ -287,11 +304,10 @@ class MonitorService : Service() {
         }
 
         val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
-        val serverUrl = normalizeServerUrl(
+        val serverUrl = normalizeHttpUrl(
             sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: ""
-        )
-        if (serverUrl.isEmpty()) {
-            Log.w(TAG, "no server URL configured; keeping events for retry")
+        ) ?: run {
+            Log.w(TAG, "invalid server URL configured; keeping events for retry")
             requeue(merged)
             return nextFailureDelay()
         }
@@ -393,10 +409,9 @@ class MonitorService : Service() {
         val existing = sp.getString("child_id", "")
         if (!existing.isNullOrEmpty()) return existing
 
-        val serverUrl = normalizeServerUrl(
+        val serverUrl = normalizeHttpUrl(
             sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: ""
-        )
-        if (serverUrl.isEmpty()) return null
+        ) ?: return null
         val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
         val name = sp.getString(ChildGuardApp.KEY_CHILD_NAME, "Child") ?: "Child"
 

@@ -84,6 +84,9 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-55 | medium | Dashboard | `--doctor` printed the parent-typed server URL raw, and the server-supplied `service` field raw, so an ESC sequence in either could clear the screen or rewrite the parent's terminal. The interactive `configure` prompt echoed the stored URL raw too. | `print(f"    server : {url}")`; `dim(f" (service={health.get('service')})")`; `input(f" ... [{cfg.get('server')}]: ")` | **Fixed 2026-11-18** — `safe_text()` on the URL, service, exception text, and configure prompt; `test_doctor_sanitizes_untrusted_server_url` asserts the clear-screen sequence is gone |
 | F-56 | medium | Android | The notification listener read `EXTRA_TITLE`/`EXTRA_TEXT`/`EXTRA_BIG_TEXT` with no length cap and queued them raw. A chat app controls those fields; 200 queued notifications could hold hundreds of MB. Feature 1 already capped at 500 chars. | `extras.getCharSequence(...)?.toString()` passed straight into the queue | **Fixed 2026-11-19** — each field and `combined` capped at 500; `notificationTextIsBounded` posts 200,000 chars and asserts title/text/combined are ≤ 500 |
 | F-57 | high | Rust server | Two bugs in request reading. (a) The 30 s socket read timeout equalled the total request budget and a timeout was mapped to `400`, so a slowloris that dribbled a byte just before each expiry could hold one of the 256 slots **indefinitely**, and a merely stalled client saw `400 Bad Request` instead of `408`. (b) `ErrorKind::Interrupted` (EINTR) was also mapped to `400`: an ordinary signal delivery killed a legitimate in-flight request at a random moment (reproduced at 0.6 s, 3.1 s and 24.2 s). | `stream.read(...).map_err(\|_\| 400u16)?` plus a fixed `SO_RCVTIMEO` of 30 s | **Fixed 2026-11-19** — the read timeout is re-armed from the remaining budget before every read, timeout ⇒ `408`, and EINTR is retried; `read_step_retries_eintr_and_classifies_timeouts` plus two socket tests on a 250 ms budget; live probe: trickle 1 B/2 s → `408` at 30.03 s, partial headers → `408` at 30.20 s, partial body → `408` at 30.20 s |
+| F-58 | medium | Both collectors | Only the **number** of events was capped, never their size. Each field was copied straight from a 2 MiB request, so 5,000 events (or 2,000 children) of near-maximum strings could pin gigabytes of RSS; `/api/export` then built a second copy, and the next `state.json` flush a third. A child who extracts the plaintext parent token can OOM the collector. | Rust: `ev.get("data")...clone()`, `name` stored whole; Node: `addEvent` claimed "bounded fields" but assigned `ev.data` raw | **Fixed 2026-11-19** — both clip `childId` (128 B), `type` (64 B), `package` (128 B), `data` (8 KiB) and the child name (128 B) before storage/hashing, using UTF-8-safe clipping; Rust `oversized_fields_are_clipped_before_storage`, Node smoke 7d. Live: stored 128/64/128/8192 B, retry `received:0`, `/api/export` 8,803 B |
+| F-59 | low | Rust server | SSE streams counted only toward the 256-connection cap, so 256 authenticated streams could occupy every request slot and the collector would answer `503` to the child's uploads. Node already caps streams separately at 64. | `st.sse.push(...)` with no stream limit | **Fixed 2026-11-19** — `MAX_SSE = 64` enforced by `add_sse_client`, which answers `503 {"error":"too many stream clients"}`; `sse_cap_rejects_clients_beyond_the_limit`; live: 64 × `200`, 65th `503` |
+| F-60 | medium | Android | Setup saved the typed server URL verbatim. A parent who entered `192.168.1.5:38080` (`URL()` throws *unknown protocol*) got no uploads at all, and the monitor swallowed the exception on every pass, so there was no visible error. Non-http schemes were accepted too. | `prefs.edit().putString(KEY_SERVER_URL, server...)` with no validation | **Fixed 2026-11-19** — `normalizeHttpUrl` fills in `http://` when the scheme is missing, rejects non-http(s)/hostless values, and is used by setup, registration and upload; `SetupActivityTest` proves `192.168.1.5:38080` saves as `http://…` and `ftp://…` shows an error without replacing the saved URL |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -581,23 +584,57 @@ complete request   ->  0.00s  HTTP/1.1 200 OK
 health after       -> {"ok":true,...}   (server still serving)
 ```
 
+## 5k. Daily audit — 2026-11-19, resource-bounds and setup-url pass
+
+Two "bounded" claims did not survive measurement: event *counts* were capped
+but field *sizes* were not, and setup accepted an endpoint the app could never
+reach. Both are fixed and measured.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Field sizes | 2 MiB per request × 5,000 events (or 2,000 children) unbounded | Clip id/type/package/data/name before storage | Rust test + Node smoke 7d; live: 128/64/128/8192 B |
+| SSE | No stream cap of its own; 256 streams could starve uploads | `MAX_SSE = 64`, `503` beyond it | unit test; live 64 × 200, 65th 503 |
+| Setup URL | Scheme-less URL saved and failed silently forever | `normalizeHttpUrl` (fill `http://`, require http(s)) everywhere | `SetupActivityTest` (2) |
+
+Why these shapes:
+
+- **Bound bytes, not just rows.** A row cap is only a memory bound if a row is
+  bounded. The Android client sends a few hundred bytes per field, so 8 KiB
+  for `data` is generous while keeping worst-case state in the tens of MiB.
+- **Clip before hashing.** Idempotency hashes the clipped values, so a retry
+  of an oversized batch is still recognised as the same event.
+- **A URL error must be visible.** Filling in `http://` handles the common
+  shorthand; rejecting anything else at setup turns a silent dead monitor into
+  an inline field error.
+
+Live probe (release binary):
+
+```
+POST oversized  -> {"ok":true,"received":1}
+retry           -> {"ok":true,"received":0}
+stored sizes    -> childId 128 B, type 64 B, package 128 B, data 8192 B
+/api/export     -> 8,803 bytes
+SSE             -> 64 × 200 OK, 65th 503 {"error":"too many stream clients"}
+health after    -> {"ok":true,...}
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 24 passed; 0 failed
+server-rust:  cargo test            → 26 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, ts coercion, LRU eviction,
-              stream limit, liveness)
-android:      54 tests, 0 failures, 0 skipped (with live server)
+              field clipping, stream limit, liveness)
+android:      56 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 6,
               DashboardActivity 2, MonitorServiceLifecycle 4,
-              WebMonitorActivity 1
+              SetupActivity 2, WebMonitorActivity 1
 dashboard:    python3 -m unittest termux/test_dashboard.py → 14 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
-              sha256 57e69efd...a6253ea
+              sha256 d2f6679f...bf1f8d
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";

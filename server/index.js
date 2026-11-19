@@ -15,6 +15,13 @@ const MAX_CHILDREN = (() => {
   return Number.isFinite(n) && n > 0 ? n : 2000;
 })();
 const MAX_DUPE_KEYS = 20000;
+// Field caps. The 2 MiB body limit bounds one request, not retained state:
+// 5,000 events (or 2,000 children) of near-2 MiB strings would pin gigabytes
+// of RSS and make /api/export allocate it again. Mirrors the Rust collector.
+const MAX_ID_BYTES = 128;
+const MAX_TYPE_BYTES = 64;
+const MAX_PACKAGE_BYTES = 128;
+const MAX_DATA_BYTES = 8 * 1024;
 const TS_FUTURE_ALLOWANCE_MS = 60 * 60 * 1000;
 // Cap SSE listeners the same way the Rust collector caps connections. One
 // leaked browser tab must not pin unbounded memory. Env-overridable so the
@@ -35,6 +42,24 @@ const state = {
 
 function now() { return Date.now(); }
 function uid() { return 'cg_' + crypto.randomBytes(8).toString('hex'); }
+
+/**
+ * Truncate to at most `maxBytes` without splitting a UTF-8 character or a
+ * surrogate pair. Iterates code points only when the string is oversized.
+ */
+function clip(value, maxBytes) {
+  const s = typeof value === 'string' ? value : '';
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s;
+  let out = '';
+  let bytes = 0;
+  for (const ch of s) {
+    const n = Buffer.byteLength(ch, 'utf8');
+    if (bytes + n > maxBytes) break;
+    out += ch;
+    bytes += n;
+  }
+  return out;
+}
 
 /** Constant-time bearer comparison (length check first, as in the Rust server). */
 function timingSafeEqual(a, b) {
@@ -119,11 +144,11 @@ function broadcast(obj) {
  * cannot inflate counts or alerts. Returns false for a duplicate.
  */
 function addEvent(childId, ev) {
-  const type = typeof ev.type === 'string' ? ev.type : 'unknown';
-  const pkg = typeof ev.package === 'string' ? ev.package : '';
-  const data = typeof ev.data === 'string'
+  const type = clip(typeof ev.type === 'string' ? ev.type : 'unknown', MAX_TYPE_BYTES);
+  const pkg = clip(typeof ev.package === 'string' ? ev.package : '', MAX_PACKAGE_BYTES);
+  const data = clip(typeof ev.data === 'string'
     ? ev.data
-    : (ev.data == null ? '' : JSON.stringify(ev.data));
+    : (ev.data == null ? '' : JSON.stringify(ev.data)), MAX_DATA_BYTES);
   const rawTs = Number(ev.ts);
   // Number(null) and Number('') are 0, which would store the event at 1970
   // and corrupt ordering/screen time. The Rust collector treats a missing or
@@ -229,6 +254,8 @@ const server = http.createServer((req, res) => {
         sendJson(res, 400, { error: 'childId required' });
         return;
       }
+      // Cap before the id becomes a Map key and part of the dedupe hash.
+      const childId = clip(d.childId, MAX_ID_BYTES);
       let events;
       if (Array.isArray(d.events)) events = d.events;
       else if (d.events && typeof d.events === 'object') events = [d.events];
@@ -238,7 +265,7 @@ const server = http.createServer((req, res) => {
       }
 
       // Auto-register unknown child ids so events are never dropped.
-      const child = state.children.get(d.childId) || bumpChild(d.childId, 'Child');
+      const child = state.children.get(childId) || bumpChild(childId, 'Child');
       child.lastSeen = now();
 
       let received = 0;
