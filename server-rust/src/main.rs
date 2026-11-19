@@ -524,15 +524,43 @@ fn read_request_with_budget(stream: &mut TcpStream, budget: Duration) -> Result<
 
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut content_length: Option<usize> = None;
+    let mut transfer_encoding = false;
     for line in lines {
         if let Some(colon) = line.find(':') {
             let key = line[..colon].trim().to_ascii_lowercase();
             let value = line[colon + 1..].trim().to_string();
-            if key == "content-length" {
-                content_length = value.trim().parse::<usize>().ok();
+            match key.as_str() {
+                "content-length" => {
+                    // RFC 7230 §3.3.3: the value must be ASCII digits only,
+                    // and repeated values must agree. Taking the last header
+                    // (or treating garbage as 0) let a contradictory request
+                    // be framed however the sender liked.
+                    let parsed = if !value.is_empty()
+                        && value.bytes().all(|b| b.is_ascii_digit())
+                    {
+                        value.parse::<usize>().ok()
+                    } else {
+                        None
+                    };
+                    let n = parsed.ok_or(400u16)?;
+                    if let Some(prev) = content_length {
+                        if prev != n {
+                            return Err(400);
+                        }
+                    }
+                    content_length = Some(n);
+                }
+                "transfer-encoding" => transfer_encoding = true,
+                _ => {}
             }
             headers.insert(key, value);
         }
+    }
+
+    // This server speaks only Content-Length framing. Guessing what a chunked
+    // body means is how request smuggling starts, so refuse it outright.
+    if transfer_encoding {
+        return Err(400);
     }
 
     let cl = content_length.unwrap_or(0);
@@ -552,6 +580,11 @@ fn read_request_with_budget(stream: &mut TcpStream, budget: Duration) -> Result<
         if body.len() > MAX_BODY {
             return Err(413);
         }
+    }
+    if body.len() < cl {
+        // EOF before the declared length: a partial request must never be
+        // applied as if it were complete.
+        return Err(400);
     }
     body.truncate(cl);
     Ok(Request {
@@ -1583,6 +1616,63 @@ mod tests {
         assert_eq!(Some(408), result.err(), "slow body must be a timeout");
         assert!(elapsed >= Duration::from_millis(150), "returned early: {elapsed:?}");
         assert!(elapsed < Duration::from_secs(1), "deadline overshot: {elapsed:?}");
+    }
+
+    /// Send one complete request (with a half-close so the server sees EOF)
+    /// and return whatever `read_request_with_budget` decided.
+    fn read_once(payload: &'static [u8]) -> Result<Request, u16> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(payload).unwrap();
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            // Drain the server's response so it never blocks on a full socket.
+            let mut b = [0u8; 64];
+            let _ = s.read(&mut b);
+        });
+        let (mut server_side, _) = listener.accept().unwrap();
+        let result = read_request_with_budget(&mut server_side, Duration::from_secs(2));
+        drop(server_side);
+        client.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn conflicting_duplicate_content_length_is_rejected() {
+        // RFC 7230 §3.3.3: two different lengths make the request invalid.
+        // The parser used to take the last one and apply the request.
+        let payload = b"POST /api/register HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nContent-Length: 14\r\n\r\n{\"name\":\"Ann\"}";
+        assert_eq!(Some(400), read_once(payload).err());
+    }
+
+    #[test]
+    fn identical_duplicate_content_length_is_accepted() {
+        let payload = b"POST /api/register HTTP/1.1\r\nHost: x\r\nContent-Length: 14\r\nContent-Length: 14\r\n\r\n{\"name\":\"Bob\"}";
+        let req = read_once(payload).unwrap();
+        assert_eq!(req.body, b"{\"name\":\"Bob\"}".to_vec());
+    }
+
+    #[test]
+    fn non_numeric_content_length_is_rejected() {
+        let payload = b"POST /api/events HTTP/1.1\r\nHost: x\r\nContent-Length: 12abc\r\n\r\n{}";
+        assert_eq!(Some(400), read_once(payload).err());
+    }
+
+    #[test]
+    fn truncated_body_is_rejected() {
+        // Declares 100 bytes, sends a complete JSON object, then EOF. The
+        // partial body used to be accepted and the handler mutated state.
+        let payload = b"POST /api/register HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{}";
+        assert_eq!(Some(400), read_once(payload).err());
+    }
+
+    #[test]
+    fn transfer_encoding_is_rejected() {
+        // A chunked body is not Content-Length framing; refuse rather than
+        // silently treat it as an empty body.
+        let payload = b"POST /api/register HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
+        assert_eq!(Some(400), read_once(payload).err());
     }
 
     #[test]

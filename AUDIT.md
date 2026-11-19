@@ -89,6 +89,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-60 | medium | Android | Setup saved the typed server URL verbatim. A parent who entered `192.168.1.5:38080` (`URL()` throws *unknown protocol*) got no uploads at all, and the monitor swallowed the exception on every pass, so there was no visible error. Non-http schemes were accepted too. | `prefs.edit().putString(KEY_SERVER_URL, server...)` with no validation | **Fixed 2026-11-19** — `normalizeHttpUrl` fills in `http://` when the scheme is missing, rejects non-http(s)/hostless values, and is used by setup, registration and upload; `SetupActivityTest` proves `192.168.1.5:38080` saves as `http://…` and `ftp://…` shows an error without replacing the saved URL |
 | F-61 | medium | Dashboard | `sync_from_server` trusted the response shape. A bare list, `{"events": null}`, or a row that is not an object (`null`, `1`) raised `AttributeError` from `_clean_id(ev, "e")` **outside** the per-row guard, aborting the entire sync before `LAST_SYNC` was written. `--doctor` likewise iterated `children` and called `c.get("online")` on strings/null. | `ev_resp.get("events", [])` then `ev.get("id")`; `sum(1 for c in children if c.get("online"))` | **Fixed 2026-11-19** — `_response_list` validates the envelope, non-dict rows are skipped, and doctor filters non-dict children; three tests drive a fake server with those exact shapes. Live: `Sync complete: 2 new records`, `--logs kept` shows the valid row, `doctor: healthy` (1 child) exit 0 |
 | F-62 | high | Rust server | The persistence thread cleared `dirty` **before** writing the snapshot. If the write then failed (disk full, read-only mount, permissions), the flag stayed clear and the collector stopped persisting entirely until the *next* request mutated state; events already accepted were lost on restart with no retry. It also marked a mutation that landed *during* the write as clean, so that event could be dropped forever. | `st.dirty = false; snapshot(&st)` then `write_snapshot(...)` ignoring the result | **Fixed 2026-11-19** — every mutation goes through `mark_dirty()` (increments `generation`); `write_snapshot` returns `bool`; the loop clears `dirty` only after a successful write *and* only if `snapshot_is_current()`; tests `failed_persist_is_reported_and_keeps_state_dirty`, `a_mutation_during_the_write_is_not_marked_clean`. Live: blocked data dir → 2 failed ticks, obstruction removed → state written on the next tick with no new request (dir `700`, file `600`) |
+| F-63 | medium | Rust server | Request framing trusted the sender. A repeated `Content-Length` silently used the **last** value, so `Content-Length: 2` followed by `Content-Length: 14` was framed as 14 and the request was applied; a non-numeric value became `0`; `Transfer-Encoding: chunked` was ignored (body dropped); and a body that ended before its declared length was accepted, so a truncated request still mutated state (proved: `Content-Length: 100` + `{}` + EOF registered a child). RFC 7230 §3.3.3 requires rejecting conflicting lengths and unsupported transfer codings. | `content_length = value.parse::<usize>().ok()` (last wins, `None` ⇒ 0) and `body.truncate(cl)` after `break` on EOF | **Fixed 2026-11-19** — lengths must be ASCII digits, repeated lengths must agree, any `Transfer-Encoding` is refused, and `body.len() < cl` is a `400`; tests `conflicting_duplicate_content_length_is_rejected`, `identical_duplicate_content_length_is_accepted`, `non_numeric_content_length_is_rejected`, `truncated_body_is_rejected`, `transfer_encoding_is_rejected`; live probe: four malformed shapes → `400`, identical duplicate + valid → `200`, only the two valid children stored |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -684,10 +685,48 @@ tick 3                  -> state.json written, events = 1, data = "write-during-
                            dir mode 700, file mode 600
 ```
 
+## 5n. Daily audit — 2026-11-19, request-framing pass
+
+The collector terminates HTTP itself (no hyper/reqwest), so it owns the framing
+rules. It was applying requests whose framing was invalid or incomplete.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Duplicate CL | Last value won; conflicting lengths accepted | Digits only, repeats must agree | two unit tests |
+| Non-numeric CL | `parse().ok()` ⇒ `None` ⇒ length 0 | Invalid value ⇒ `400` | `non_numeric_content_length_is_rejected` |
+| Chunked | `Transfer-Encoding` ignored; body dropped | Any TE ⇒ `400` | `transfer_encoding_is_rejected` |
+| Truncated | EOF before declared length ⇒ partial request applied | `body.len() < cl` ⇒ `400` | `truncated_body_is_rejected` |
+
+Why these shapes:
+
+- **Frame first, parse second.** If the server and any intermediary disagree
+  about where the body ends, the bytes after it are attacker-chosen. This
+  server always answers `Connection: close`, so it cannot be desynced into
+  serving a smuggled request on the same socket, but a proxy in front can.
+- **A partial body is not a small body.** `{}` is valid JSON; accepting it
+  after a truncated `Content-Length` means a dropped connection can still
+  perform a write. Rejecting is the only safe reading.
+- **Identical duplicates stay legal.** Some clients legitimately repeat the
+  same length; refusing them would break compatibility for no gain. Only
+  disagreement is an error.
+
+Live probe against the release binary (each request half-closes after sending):
+
+```
+dup CL (2 then 14), body 14   -> 400 {"error":"bad request"}
+truncated CL 100, body {}     -> 400 {"error":"bad request"}
+CL: 12abc                     -> 400 {"error":"bad request"}
+TE: chunked                   -> 400 {"error":"bad request"}
+identical dup CL (14, 14)     -> 200 {"childId":"cg_21d6…"}
+valid register                -> 200 {"childId":"cg_9d58…"}
+children after                -> Bob, Dee only (no phantom "Child")
+health after                  -> {"ok":true,…}
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 28 passed; 0 failed
+server-rust:  cargo test            → 33 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, ts coercion, LRU eviction,
