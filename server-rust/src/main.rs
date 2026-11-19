@@ -120,6 +120,22 @@ struct AppState {
     seen_order: VecDeque<u64>,
     /// Set by mutating handlers; the background persister flushes it.
     dirty: bool,
+    /// Incremented on every mutation. The persister only clears `dirty` when
+    /// the generation it wrote is still current, so a request that arrives
+    /// during the write (or a write that failed) is never marked clean.
+    generation: u64,
+}
+
+/// Mark the state as needing a flush. Every mutation must go through this so
+/// the write and the "clean" decision refer to the same generation.
+fn mark_dirty(st: &mut AppState) {
+    st.dirty = true;
+    st.generation = st.generation.wrapping_add(1);
+}
+
+/// True when the snapshot written at `generation` is still the current state.
+fn snapshot_is_current(st: &AppState, generation: u64) -> bool {
+    st.generation == generation
 }
 
 /// Lock the shared state without letting a poisoned mutex take the service
@@ -140,14 +156,14 @@ fn snapshot(st: &AppState) -> serde_json::Value {
 /// Persist a snapshot as JSON, atomically (tmp file + rename) and readable by
 /// the owner only: the file holds the child's captured messages, so it must
 /// not be world-readable.
-fn write_snapshot(snapshot: &serde_json::Value, dir: &std::path::Path) {
+fn write_snapshot(snapshot: &serde_json::Value, dir: &std::path::Path) -> bool {
     // Only tighten a directory this process creates. If an operator points
     // CHILDGUARD_DATA_DIR at an existing directory, changing its mode could
     // break unrelated services (or /tmp).
     let created_dir = !dir.exists();
     if let Err(e) = fs::create_dir_all(dir) {
         eprintln!("persist mkdir failed: {}", e);
-        return;
+        return false;
     }
     #[cfg(unix)]
     if created_dir {
@@ -193,13 +209,16 @@ fn write_snapshot(snapshot: &serde_json::Value, dir: &std::path::Path) {
     if let Err(e) = res {
         eprintln!("persist failed: {}", e);
         let _ = fs::remove_file(&tmp);
+        false
+    } else {
+        true
     }
 }
 
 /// Persist the state now (used by tests and one-shot callers).
 #[allow(dead_code)] // used by the test module
-fn persist_state_to(st: &AppState, dir: &std::path::Path) {
-    write_snapshot(&snapshot(st), dir);
+fn persist_state_to(st: &AppState, dir: &std::path::Path) -> bool {
+    write_snapshot(&snapshot(st), dir)
 }
 
 /// Load previously persisted state at startup.
@@ -617,7 +636,7 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
             registered_at: now,
         },
     );
-    st.dirty = true;
+    mark_dirty(&mut st);
     Ok((200, serde_json::json!({ "childId": id })))
 }
 
@@ -758,7 +777,7 @@ fn handle_events(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, serd
         }
         received += 1;
     }
-    st.dirty = true;
+    mark_dirty(&mut st);
 
     // broadcast to SSE clients
     let ev_msg = serde_json::json!({ "type": "event", "childId": child_id, "event": last_event });
@@ -934,6 +953,7 @@ fn main() {
         seen: HashSet::new(),
         seen_order: VecDeque::new(),
         dirty: false,
+        generation: 0,
     }));
     {
         let mut st = lock_state(&state);
@@ -948,15 +968,21 @@ fn main() {
             let pstate = Arc::clone(&state);
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_millis(PERSIST_INTERVAL_MS));
-                let snap = {
-                    let mut st = lock_state(&pstate);
+                let (snap, generation) = {
+                    let st = lock_state(&pstate);
                     if !st.dirty {
                         continue;
                     }
-                    st.dirty = false;
-                    snapshot(&st)
+                    (snapshot(&st), st.generation)
                 };
-                write_snapshot(&snap, std::path::Path::new(&dir));
+                // Only clear the flag after a successful write, and only if
+                // no request mutated the state while the write was running.
+                if write_snapshot(&snap, std::path::Path::new(&dir)) {
+                    let mut st = lock_state(&pstate);
+                    if snapshot_is_current(&st, generation) {
+                        st.dirty = false;
+                    }
+                }
             });
         }
     }
@@ -1082,6 +1108,7 @@ mod tests {
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
             dirty: false,
+            generation: 0,
         }))
     }
 
@@ -1316,7 +1343,7 @@ mod tests {
         let _ = handle_events(&state, body.as_bytes()).unwrap();
         {
             let st = state.lock().unwrap();
-            persist_state_to(&st, &dir);
+            assert!(persist_state_to(&st, &dir), "persist reported failure");
         }
         drop(state);
 
@@ -1331,6 +1358,46 @@ mod tests {
             assert!(st.children.contains_key("cg_pers"));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_persist_is_reported_and_keeps_state_dirty() {
+        let dir = std::env::temp_dir().join(format!("cg_persistfail_{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let state = test_state("secret");
+        {
+            let mut st = state.lock().unwrap();
+            mark_dirty(&mut st);
+            assert!(
+                !persist_state_to(&st, &blocked),
+                "a write into a non-directory must report failure"
+            );
+            assert!(st.dirty, "a failed write must not mark the state clean");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mutation_during_the_write_is_not_marked_clean() {
+        let state = test_state("secret");
+        let generation = {
+            let mut st = state.lock().unwrap();
+            mark_dirty(&mut st);
+            st.generation
+        };
+        // Simulate a request that lands while the persister is writing.
+        {
+            let mut st = state.lock().unwrap();
+            mark_dirty(&mut st);
+        }
+        let mut st = state.lock().unwrap();
+        if snapshot_is_current(&st, generation) {
+            st.dirty = false;
+        }
+        assert!(st.dirty, "mutation during the write was marked clean");
+        assert_eq!(st.generation, generation.wrapping_add(1));
     }
 
     #[test]

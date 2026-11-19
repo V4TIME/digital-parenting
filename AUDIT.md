@@ -88,6 +88,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-59 | low | Rust server | SSE streams counted only toward the 256-connection cap, so 256 authenticated streams could occupy every request slot and the collector would answer `503` to the child's uploads. Node already caps streams separately at 64. | `st.sse.push(...)` with no stream limit | **Fixed 2026-11-19** — `MAX_SSE = 64` enforced by `add_sse_client`, which answers `503 {"error":"too many stream clients"}`; `sse_cap_rejects_clients_beyond_the_limit`; live: 64 × `200`, 65th `503` |
 | F-60 | medium | Android | Setup saved the typed server URL verbatim. A parent who entered `192.168.1.5:38080` (`URL()` throws *unknown protocol*) got no uploads at all, and the monitor swallowed the exception on every pass, so there was no visible error. Non-http schemes were accepted too. | `prefs.edit().putString(KEY_SERVER_URL, server...)` with no validation | **Fixed 2026-11-19** — `normalizeHttpUrl` fills in `http://` when the scheme is missing, rejects non-http(s)/hostless values, and is used by setup, registration and upload; `SetupActivityTest` proves `192.168.1.5:38080` saves as `http://…` and `ftp://…` shows an error without replacing the saved URL |
 | F-61 | medium | Dashboard | `sync_from_server` trusted the response shape. A bare list, `{"events": null}`, or a row that is not an object (`null`, `1`) raised `AttributeError` from `_clean_id(ev, "e")` **outside** the per-row guard, aborting the entire sync before `LAST_SYNC` was written. `--doctor` likewise iterated `children` and called `c.get("online")` on strings/null. | `ev_resp.get("events", [])` then `ev.get("id")`; `sum(1 for c in children if c.get("online"))` | **Fixed 2026-11-19** — `_response_list` validates the envelope, non-dict rows are skipped, and doctor filters non-dict children; three tests drive a fake server with those exact shapes. Live: `Sync complete: 2 new records`, `--logs kept` shows the valid row, `doctor: healthy` (1 child) exit 0 |
+| F-62 | high | Rust server | The persistence thread cleared `dirty` **before** writing the snapshot. If the write then failed (disk full, read-only mount, permissions), the flag stayed clear and the collector stopped persisting entirely until the *next* request mutated state; events already accepted were lost on restart with no retry. It also marked a mutation that landed *during* the write as clean, so that event could be dropped forever. | `st.dirty = false; snapshot(&st)` then `write_snapshot(...)` ignoring the result | **Fixed 2026-11-19** — every mutation goes through `mark_dirty()` (increments `generation`); `write_snapshot` returns `bool`; the loop clears `dirty` only after a successful write *and* only if `snapshot_is_current()`; tests `failed_persist_is_reported_and_keeps_state_dirty`, `a_mutation_during_the_write_is_not_marked_clean`. Live: blocked data dir → 2 failed ticks, obstruction removed → state written on the next tick with no new request (dir `700`, file `600`) |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -649,10 +650,44 @@ Live probe against a fake server returning `events:[null,1,{…}]`,
              doctor: healthy (exit 0)
 ```
 
+## 5m. Daily audit — 2026-11-19, persistence-durability pass
+
+The collector's persistence is coalesced: handlers only set a flag, and a
+background thread writes a snapshot every 2 s. The flag handling was wrong in
+two ways, and both lost data silently.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Failed write | `dirty` cleared before writing; a failed write left it clear, so nothing was retried until a new request arrived | Clear only after `write_snapshot` returns `true` | `failed_persist_is_reported_and_keeps_state_dirty` |
+| Write race | A request during the write was marked clean by the writer | `generation` counter; clear only if `snapshot_is_current` | `a_mutation_during_the_write_is_not_marked_clean` |
+| Observability | `write_snapshot` returned nothing | Returns `bool`; `persist_state_to` too | `persist_roundtrip` asserts success |
+
+Why these shapes:
+
+- **"Dirty" is a promise, not a guess.** It may only be cleared by evidence
+  that the exact state it describes is on disk. A generation counter is the
+  cheapest way to know the snapshot you wrote is still the current one.
+- **Disk failures are normal, not exceptional.** ENOSPC, a full SD card, or a
+  read-only remount should make the collector retry every tick, not go quiet.
+  The retry loop is the existing one; it just was not allowed to run.
+
+Live probe: data dir pointed at a regular file so `create_dir_all` fails for
+every write, one event posted, then the obstruction removed with **no further
+requests**:
+
+```
+POST /api/events        -> {"ok":true,"received":1}
+tick 1 (blocked)        -> persist mkdir failed: File exists
+tick 2 (blocked)        -> persist mkdir failed: File exists   (retried, not silent)
+obstruction removed
+tick 3                  -> state.json written, events = 1, data = "write-during-outage"
+                           dir mode 700, file mode 600
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 26 passed; 0 failed
+server-rust:  cargo test            → 28 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, ts coercion, LRU eviction,
