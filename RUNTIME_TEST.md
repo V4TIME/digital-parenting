@@ -11,7 +11,7 @@ Two layers of proof, plus the small part that needs a real phone.
 | `Feature1ExtractionTest` (15) | extraction/regex logic on `NodeLike`, password-field exclusion, bounded view traversal, screen-dump dedupe, alert precision | none (pure JVM) |
 | `UploadBatchingTest` (6) | 600-event backlog → 250+250+100 batches, retry limit, notification `data` field, failure classification, backoff, URL normalization | none (pure JVM) |
 | `Feature1RuntimeTest` (11) | **`onAccessibilityEvent` → `eventQueue`** on the real service, scroll subscription, password events ignored, chat-only fallback dedupe | Robolectric API 34 |
-| `Feature3NotificationTest` (10) | **`onNotificationPosted` → queue**, alert precision, chat-only allowlist, re-post dedupe, queue cap | Robolectric API 34 |
+| `Feature3NotificationTest` (11) | **`onNotificationPosted` → queue**, alert precision, chat-only allowlist, re-post dedupe, queue cap, text bound | Robolectric API 34 |
 | `Feature1ServerE2ETest` (4) | **`eventQueue` → `MonitorService` upload → server** | Robolectric API 34 + live server |
 | `DashboardActivityTest` (2) | **"Monitoring: ON" actually starts `MonitorService`** (first-run flow), and OFF does not | Robolectric API 34 |
 | `MonitorServiceLifecycleTest` (4) | explicit STOP is not sticky; a null-intent system restart resumes or stops cleanly | Robolectric API 34 |
@@ -32,7 +32,7 @@ CHILDGUARD_SERVER=http://127.0.0.1:38080 CHILDGUARD_TOKEN=testsecret \
   gradle :app:cleanTestDebugUnitTest :app:testDebugUnitTest --tests "*Feature1ServerE2ETest"
 ```
 
-Last run: **53 tests, 0 failures, 0 skipped** (live collector; the 4 E2E tests
+Last run: **54 tests, 0 failures, 0 skipped** (live collector; the 4 E2E tests
 skip when no server is configured).
 
 ### What `Feature1RuntimeTest` drives

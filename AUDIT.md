@@ -82,6 +82,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-53 | low | Rust server | Non-object entries in `events` (strings, numbers, arrays) were stored as empty events (`type`/`package` empty, `data` empty), inflating counts. Node already skipped them. | loop body ran `ev.get(...)` on any JSON value | **Fixed 2026-11-18** — `if !ev.is_object() { continue; }`; the zero-timestamp test sends `"not-an-object"` and `42` and asserts `received == 2` |
 | F-54 | medium | Dashboard | A `config.json` that parses to a non-object (`[]`, `null`, `"text"`, or `{"server": 5, "token": null}`) made **every** command crash with `AttributeError: 'list' object has no attribute 'get'`, including `--doctor` and `--sync`. | `return json.load(f)` with no shape check | **Fixed 2026-11-18** — `load_config` accepts only a dict and coerces `server`/`token` to strings; `test_malformed_config_falls_back_to_defaults` runs four shapes and asserts no traceback |
 | F-55 | medium | Dashboard | `--doctor` printed the parent-typed server URL raw, and the server-supplied `service` field raw, so an ESC sequence in either could clear the screen or rewrite the parent's terminal. The interactive `configure` prompt echoed the stored URL raw too. | `print(f"    server : {url}")`; `dim(f" (service={health.get('service')})")`; `input(f" ... [{cfg.get('server')}]: ")` | **Fixed 2026-11-18** — `safe_text()` on the URL, service, exception text, and configure prompt; `test_doctor_sanitizes_untrusted_server_url` asserts the clear-screen sequence is gone |
+| F-56 | medium | Android | The notification listener read `EXTRA_TITLE`/`EXTRA_TEXT`/`EXTRA_BIG_TEXT` with no length cap and queued them raw. A chat app controls those fields; 200 queued notifications could hold hundreds of MB. Feature 1 already capped at 500 chars. | `extras.getCharSequence(...)?.toString()` passed straight into the queue | **Fixed 2026-11-19** — each field and `combined` capped at 500; `notificationTextIsBounded` posts 200,000 chars and asserts title/text/combined are ≤ 500 |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -518,6 +519,34 @@ Verification for this pass:
 dashboard: python3 -m unittest termux/test_dashboard.py -> 14 tests, OK
 ```
 
+## 5i. Daily audit — 2026-11-19, notification-bound pass
+
+Feature 3 trusted the notification's own text fields. A chat app (or anything
+that can post as one) controls title/text/bigText, so this pass bounded that
+path the same way Feature 1 already bounds screen text.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Notification text | `EXTRA_TITLE`/`EXTRA_TEXT`/`EXTRA_BIG_TEXT` queued raw; 200 items × unbounded strings | Cap every field and `combined` at 500 chars | `Feature3NotificationTest.notificationTextIsBounded` posts 200,000 chars and asserts ≤ 500 on all three |
+
+Why this shape:
+
+- **Same bound on both capture paths.** Accessibility text was already capped
+  at 500; leaving notifications uncapped made the smaller surface the way to
+  exhaust the queue. The cap is applied before the dedupe key is built, so the
+  key is bounded too.
+- **Bound, don't truncate silently at render.** Capping on entry keeps the
+  in-memory queue and the upload body predictable; the dashboard still
+  sanitizes for terminal safety.
+
+Verification for this pass:
+
+```
+android:   54 tests, 0 failures, 0 skipped (live collector; +1 notification bound)
+apk:       7,400,089 bytes, sha256 57e69efd...a6253ea
+server:    Rust 20, Node smoke, dashboard 14 unchanged and green
+```
+
 ## 6. Verification log (this audit)
 
 ```
@@ -526,15 +555,15 @@ server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, ts coercion, LRU eviction,
               stream limit, liveness)
-android:      53 tests, 0 failures, 0 skipped (with live server)
+android:      54 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
-              Feature3Notification 10, Feature1ServerE2E 4, UploadBatching 6,
+              Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 6,
               DashboardActivity 2, MonitorServiceLifecycle 4,
               WebMonitorActivity 1
 dashboard:    python3 -m unittest termux/test_dashboard.py → 14 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
-              sha256 7dabac98...e4eec7ba
+              sha256 57e69efd...a6253ea
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";

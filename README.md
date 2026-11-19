@@ -6,7 +6,7 @@
   running on hardware and a network you control.
   <br><br>
   <img src="docs/badges/android.svg" alt="Android: target SDK 35" height="28">
-  <img src="docs/badges/tests.svg" alt="53 tests passing" height="28">
+  <img src="docs/badges/tests.svg" alt="54 tests passing" height="28">
   <img src="docs/badges/rust.svg" alt="Rust collector, 656 kB" height="28">
   <img src="docs/badges/network.svg" alt="Tailnet only" height="28">
   <!-- Local SVG assets only: no external badge services. Keep tests.svg in sync. -->
@@ -25,7 +25,7 @@
 > [!NOTE]
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
-> dashboard. The full suite is **53 tests, 0 failures, 0 skipped** against a
+> dashboard. The full suite is **54 tests, 0 failures, 0 skipped** against a
 > live collector, plus 20 collector tests and 14 dashboard regression tests.
 > Remaining work is a run on a physical phone; no Android device or KVM is
 > available in the build environment.
@@ -44,7 +44,7 @@
 | # | Feature | What actually ships | Status |
 |---|---|---|---|
 | **1** | Accessibility capture | Typed text, keystrokes, visible screen text, active app, scroll-loaded content; stranger-signal detection with alert dedupe; password/PIN fields excluded | ✅ **Verified end to end** (15 unit + 11 runtime + 4 E2E tests) |
-| **3** | Notification listener | Chat notifications only, stranger classification, 30 s re-post dedupe, bounded queue, chat-only fallback | ✅ **Verified** (10 runtime tests) |
+| **3** | Notification listener | Chat notifications only, stranger classification, 30 s re-post dedupe, bounded queue, 500-char text cap, chat-only fallback | ✅ **Verified** (11 runtime tests) |
 | **6** | Transport + dashboard | Bounded batches, retries for flaky mobile data, crash-safe service lifecycle, sync, logs, screen time, alerts, export, doctor | ✅ **Verified** (4 lifecycle + 6 transport tests) |
 | **5** | Reverse session | Not shipped. A no-auth, no-TLS shell is a liability in a parenting app; the prototype lives in [`docs/prototype/`](docs/prototype/README.md) | ⛔ **Prototype only** |
 
@@ -181,10 +181,10 @@ method are in [`AUDIT.md`](AUDIT.md) and [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 | Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **14 passed, 0 failed** |
 | Collector lints | `cargo clippy --offline -- -D warnings` | **exit 0** |
 | Legacy collector | `node server/smoke_test.js` | **SMOKE OK** |
-| Android suite | `gradle :app:testDebugUnitTest --offline` | **53 tests, 0 failures, 0 skipped** |
+| Android suite | `gradle :app:testDebugUnitTest --offline` | **54 tests, 0 failures, 0 skipped** |
 | Connection | `python3 termux/dashboard.py --doctor` | **exit 0**, live counts |
 | Failure modes | wrong token / dead collector | **exit 3 / exit 2**, no crash |
-| APK | `:app:assembleDebug` | 7,400,089 bytes, `sha256 7dabac98…e4eec7ba` |
+| APK | `:app:assembleDebug` | 7,400,089 bytes, `sha256 57e69efd…a6253ea` |
 
 The Android suite includes real `onAccessibilityEvent` and
 `onNotificationPosted` calls under Robolectric API 34, plus four tests that

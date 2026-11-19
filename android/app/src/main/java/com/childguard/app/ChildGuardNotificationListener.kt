@@ -22,6 +22,10 @@ class ChildGuardNotificationListener : NotificationListenerService() {
     companion object {
         private const val TAG = "ChildGuardNL"
         private const val MAX_QUEUE = 200
+        /** Notification text is app-supplied and can be arbitrarily large
+         *  (bigText especially). Bound it before it enters the queue, matching
+         *  the accessibility path's 500-char cap. */
+        private const val MAX_TEXT_LEN = 500
 
         /** How long an identical (package, text) notification is treated as a
          * re-post of the previous one. */
@@ -113,11 +117,17 @@ class ChildGuardNotificationListener : NotificationListenerService() {
         if (!isChatApp(pkg)) return
 
         val extras = sbn.notification?.extras ?: return
-        val title = extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString() ?: ""
-        val text = extras.getCharSequence(NotificationCompat.EXTRA_TEXT)?.toString() ?: ""
-        val bigText = extras.getCharSequence(NotificationCompat.EXTRA_BIG_TEXT)?.toString() ?: ""
+        val title = (extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString() ?: "")
+            .take(MAX_TEXT_LEN)
+        val text = (extras.getCharSequence(NotificationCompat.EXTRA_TEXT)?.toString() ?: "")
+            .take(MAX_TEXT_LEN)
+        val bigText = (extras.getCharSequence(NotificationCompat.EXTRA_BIG_TEXT)?.toString() ?: "")
+            .take(MAX_TEXT_LEN)
 
-        val combined = listOf(title, text, bigText).filter { it.isNotBlank() }.joinToString(" | ")
+        val combined = listOf(title, text, bigText)
+            .filter { it.isNotBlank() }
+            .joinToString(" | ")
+            .take(MAX_TEXT_LEN)
         if (combined.length < 3) return
         if (isDuplicate(pkg, combined)) return
 

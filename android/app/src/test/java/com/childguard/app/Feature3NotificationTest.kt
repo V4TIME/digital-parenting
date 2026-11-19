@@ -153,6 +153,22 @@ class Feature3NotificationTest {
     }
 
     @Test
+    fun notificationTextIsBounded() {
+        // A chat app controls its notification text and bigText; a multi-MB
+        // payload must not be queued verbatim (200 entries would be unbounded).
+        val huge = "a".repeat(200_000)
+        listener.onNotificationPosted(sbn("com.whatsapp", huge, huge))
+
+        val ev = onlyQueued()
+        assertTrue("title unbounded: ${ev.optString("title").length}",
+            ev.optString("title").length <= 500)
+        assertTrue("text unbounded: ${ev.optString("text").length}",
+            ev.optString("text").length <= 500)
+        assertTrue("combined unbounded: ${ev.optString("combined").length}",
+            ev.optString("combined").length <= 500)
+    }
+
+    @Test
     fun notificationQueueIsBounded() {
         for (i in 1..260) {
             listener.onNotificationPosted(sbn("com.whatsapp", "Mom", "message $i"))
