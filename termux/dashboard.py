@@ -318,7 +318,11 @@ def run_doctor(cfg, timeout=5):
         print("    auth   : " + red(f"unexpected response {stats!r}"))
         return 4
 
-    children = stats.get("children") or []
+    children = stats.get("children")
+    if not isinstance(children, list):
+        children = []
+    # A child entry is server-supplied; a string/null must not crash doctor.
+    children = [c for c in children if isinstance(c, dict)]
     online = sum(1 for c in children if c.get("online"))
     print("    auth   : " + green("OK"))
     print(
@@ -331,6 +335,19 @@ def run_doctor(cfg, timeout=5):
         print(dim("             no events yet — open the app and type in a monitored app"))
     print(green("  doctor: healthy"))
     return 0
+
+
+def _response_list(resp, key):
+    """Return the list under `key`, or [] for any malformed response shape.
+
+    Sync runs from cron against whatever the collector returns. A bare list,
+    `{"events": null}`, or a non-dict row must be skipped, not raise: the
+    traceback used to abort the whole sync and leave LAST_SYNC untouched.
+    """
+    if not isinstance(resp, dict):
+        return []
+    value = resp.get(key)
+    return value if isinstance(value, list) else []
 
 
 def sync_from_server(con, cfg, verbose=True):
@@ -367,7 +384,9 @@ def sync_from_server(con, cfg, verbose=True):
         except (TypeError, ValueError):
             return int(time.time() * 1000)
 
-    for ev in ev_resp.get("events", []):
+    for ev in _response_list(ev_resp, "events"):
+        if not isinstance(ev, dict):
+            continue
         _id = _clean_id(ev, "e")
         try:
             before = con.total_changes
@@ -386,7 +405,9 @@ def sync_from_server(con, cfg, verbose=True):
             added += con.total_changes - before
         except Exception:
             pass
-    for al in al_resp.get("alerts", []):
+    for al in _response_list(al_resp, "alerts"):
+        if not isinstance(al, dict):
+            continue
         _id = _clean_id(al, "a")
         detail = al.get("detail")
         try:

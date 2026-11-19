@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -333,6 +334,81 @@ class ConfigPermissionTest(unittest.TestCase):
 
         leftovers = [n for n in os.listdir(exports) if n != bundles[0]]
         self.assertEqual([], leftovers, f"temp export files left behind: {leftovers}")
+
+
+    def _start_fake_server(self, routes):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                raw = json.dumps(routes.get(path, {})).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _write_server_config(self, port, token="x"):
+        with open(os.path.join(self.home, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"server": f"http://127.0.0.1:{port}", "token": token}, f)
+
+    def test_sync_survives_malformed_rows_and_response_shapes(self):
+        port = self._start_fake_server({
+            "/api/events": {"events": [None, 1, {
+                "id": None, "ts": "x", "type": "keylog",
+                "package": "p", "data": "kept",
+            }]},
+            "/api/alerts": {"alerts": [None, {
+                "id": "a1", "ts": None, "severity": None,
+                "reason": None, "detail": None,
+            }]},
+        })
+        self._write_server_config(port)
+
+        proc = run_dashboard(self.home, "--sync")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr + proc.stdout)
+        self.assertIn("Sync complete: 2 new records", proc.stdout)
+
+        logs = run_dashboard(self.home, "--logs", "kept")
+        self.assertEqual(0, logs.returncode, logs.stderr)
+        self.assertIn("kept", logs.stdout)
+
+    def test_sync_survives_a_bare_list_response(self):
+        # Not a dict at all: the old code crashed on ev_resp.get(...).
+        port = self._start_fake_server({
+            "/api/events": [],
+            "/api/alerts": [],
+        })
+        self._write_server_config(port)
+        proc = run_dashboard(self.home, "--sync")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr + proc.stdout)
+        self.assertIn("Sync complete: 0 new records", proc.stdout)
+
+    def test_doctor_survives_non_dict_children(self):
+        port = self._start_fake_server({
+            "/health": {"ok": True, "service": "fake"},
+            "/api/stats": {
+                "ok": True, "totalEvents": 1, "totalAlerts": 0,
+                "children": ["x", None, {"id": "c", "online": True}],
+            },
+        })
+        self._write_server_config(port)
+        proc = run_dashboard(self.home, "--doctor")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr + proc.stdout)
+        self.assertIn("1 child(ren), 1 online", proc.stdout)
 
 
 if __name__ == "__main__":

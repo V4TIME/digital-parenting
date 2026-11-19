@@ -87,6 +87,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-58 | medium | Both collectors | Only the **number** of events was capped, never their size. Each field was copied straight from a 2 MiB request, so 5,000 events (or 2,000 children) of near-maximum strings could pin gigabytes of RSS; `/api/export` then built a second copy, and the next `state.json` flush a third. A child who extracts the plaintext parent token can OOM the collector. | Rust: `ev.get("data")...clone()`, `name` stored whole; Node: `addEvent` claimed "bounded fields" but assigned `ev.data` raw | **Fixed 2026-11-19** — both clip `childId` (128 B), `type` (64 B), `package` (128 B), `data` (8 KiB) and the child name (128 B) before storage/hashing, using UTF-8-safe clipping; Rust `oversized_fields_are_clipped_before_storage`, Node smoke 7d. Live: stored 128/64/128/8192 B, retry `received:0`, `/api/export` 8,803 B |
 | F-59 | low | Rust server | SSE streams counted only toward the 256-connection cap, so 256 authenticated streams could occupy every request slot and the collector would answer `503` to the child's uploads. Node already caps streams separately at 64. | `st.sse.push(...)` with no stream limit | **Fixed 2026-11-19** — `MAX_SSE = 64` enforced by `add_sse_client`, which answers `503 {"error":"too many stream clients"}`; `sse_cap_rejects_clients_beyond_the_limit`; live: 64 × `200`, 65th `503` |
 | F-60 | medium | Android | Setup saved the typed server URL verbatim. A parent who entered `192.168.1.5:38080` (`URL()` throws *unknown protocol*) got no uploads at all, and the monitor swallowed the exception on every pass, so there was no visible error. Non-http schemes were accepted too. | `prefs.edit().putString(KEY_SERVER_URL, server...)` with no validation | **Fixed 2026-11-19** — `normalizeHttpUrl` fills in `http://` when the scheme is missing, rejects non-http(s)/hostless values, and is used by setup, registration and upload; `SetupActivityTest` proves `192.168.1.5:38080` saves as `http://…` and `ftp://…` shows an error without replacing the saved URL |
+| F-61 | medium | Dashboard | `sync_from_server` trusted the response shape. A bare list, `{"events": null}`, or a row that is not an object (`null`, `1`) raised `AttributeError` from `_clean_id(ev, "e")` **outside** the per-row guard, aborting the entire sync before `LAST_SYNC` was written. `--doctor` likewise iterated `children` and called `c.get("online")` on strings/null. | `ev_resp.get("events", [])` then `ev.get("id")`; `sum(1 for c in children if c.get("online"))` | **Fixed 2026-11-19** — `_response_list` validates the envelope, non-dict rows are skipped, and doctor filters non-dict children; three tests drive a fake server with those exact shapes. Live: `Sync complete: 2 new records`, `--logs kept` shows the valid row, `doctor: healthy` (1 child) exit 0 |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -618,6 +619,36 @@ SSE             -> 64 × 200 OK, 65th 503 {"error":"too many stream clients"}
 health after    -> {"ok":true,...}
 ```
 
+## 5l. Daily audit — 2026-11-19, dashboard response-shape pass
+
+The dashboard treats the collector as trusted. It is not: it can be an older
+build, a misconfigured proxy, or a compromised host. Sync runs unattended from
+cron, so a crash there silently stops the parent's view.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Sync envelope | A bare list or `{"events": null}` crashed `.get(...)` | `_response_list` returns `[]` for any non-dict/non-list | `test_sync_survives_a_bare_list_response` |
+| Sync rows | `null`/`1` in `events` crashed `ev.get("id")` outside the guard | Skip rows that are not objects | `test_sync_survives_malformed_rows_and_response_shapes` |
+| Doctor children | `c.get("online")` on a string/null | Keep only dict entries | `test_doctor_survives_non_dict_children` |
+
+Why these shapes:
+
+- **One bad row must not cost the whole sync.** The per-row `try` only covered
+  the SQL; shape errors happened before it. Validate first, then insert.
+- **Doctor should report, not traceback.** A wrong `/api/stats` shape is a
+  verdict (exit 4) or something to skip — never an exception the parent cannot
+  read.
+
+Live probe against a fake server returning `events:[null,1,{…}]`,
+`alerts:[null,{…}]`, `children:["x",null,{…}]`:
+
+```
+--sync    -> Sync complete: 2 new records   (exit 0)
+--logs    -> [..] typing  kept              (valid row survived)
+--doctor  -> data: 1 events, 0 alerts, 1 child(ren), 1 online
+             doctor: healthy (exit 0)
+```
+
 ## 6. Verification log (this audit)
 
 ```
@@ -632,7 +663,7 @@ android:      56 tests, 0 failures, 0 skipped (with live server)
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 6,
               DashboardActivity 2, MonitorServiceLifecycle 4,
               SetupActivity 2, WebMonitorActivity 1
-dashboard:    python3 -m unittest termux/test_dashboard.py → 14 passed
+dashboard:    python3 -m unittest termux/test_dashboard.py → 17 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
               sha256 d2f6679f...bf1f8d
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
