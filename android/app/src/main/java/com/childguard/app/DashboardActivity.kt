@@ -63,6 +63,15 @@ class DashboardActivity : AppCompatActivity() {
         // Uploads run in a background thread while this screen is open, so
         // re-read on every resume instead of only in onCreate.
         val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
+        val tvUpload = findViewById<TextView>(R.id.tv_upload)
+        val uploadWarning = MonitorService.uploadWarning(sp)
+        if (uploadWarning == null) {
+            tvUpload.visibility = View.GONE
+        } else {
+            tvUpload.text = uploadWarning
+            tvUpload.visibility = View.VISIBLE
+        }
+
         val tvDropped = findViewById<TextView>(R.id.tv_dropped)
         val warning = MonitorService.droppedWarning(sp)
         if (warning == null) {

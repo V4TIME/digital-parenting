@@ -111,6 +111,26 @@ class DashboardActivityTest {
     }
 
     @Test
+    fun currentUploadProblemIsVisibleAndClearsWhenFixed() {
+        prefs.edit().putBoolean(ChildGuardApp.KEY_MONITORING, false).apply()
+        MonitorService.noteUploadError(prefs, "server answered HTTP 401", 1_700_000_000_000L)
+
+        val controller = Robolectric.buildActivity(DashboardActivity::class.java)
+            .create().start().resume()
+        val tv = controller.get().findViewById<android.widget.TextView>(R.id.tv_upload)
+        assertEquals(android.view.View.VISIBLE, tv.visibility)
+        assertTrue("must name the problem: ${tv.text}", tv.text.contains("HTTP 401"))
+        assertTrue("must say it keeps trying: ${tv.text}", tv.text.contains("Retrying"))
+
+        // The next successful upload clears it; the dashboard must not keep
+        // warning about an outage that is over.
+        MonitorService.clearUploadError(prefs)
+        controller.pause().resume()
+        assertEquals(android.view.View.GONE, tv.visibility)
+        assertNull(MonitorService.uploadWarning(prefs))
+    }
+
+    @Test
     fun droppedCounterAccumulatesAndReadsNaturally() {
         MonitorService.noteDroppedEvents(prefs, 1, 422)
         assertEquals("1 event was rejected by the server (HTTP 422). Check the server URL and token in Setup.",

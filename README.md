@@ -6,7 +6,7 @@
   running on hardware and a network you control.
   <br><br>
   <img src="docs/badges/android.svg" alt="Android: target SDK 35" height="28">
-  <img src="docs/badges/tests.svg" alt="65 tests passing" height="28">
+  <img src="docs/badges/tests.svg" alt="66 tests passing" height="28">
   <img src="docs/badges/rust.svg" alt="Rust collector, 681 kB" height="28">
   <img src="docs/badges/network.svg" alt="Tailnet only" height="28">
   <!-- Local SVG assets only: no external badge services. Keep tests.svg in sync. -->
@@ -25,7 +25,7 @@
 > [!NOTE]
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
-> dashboard. The full suite is **65 tests, 0 failures, 0 skipped** against a
+> dashboard. The full suite is **66 tests, 0 failures, 0 skipped** against a
 > live collector, plus 37 collector tests and 21 dashboard regression tests.
 > Remaining work is a run on a physical phone; no Android device or KVM is
 > available in the build environment.
@@ -111,7 +111,9 @@ If the collector **permanently rejects** a batch (`400`/`415`/`422`), the app
 first splits it to isolate the bad event, then drops only that event. Whatever
 was lost is surfaced, not swallowed: the dashboard shows a red line naming the
 count and HTTP status, the ongoing notification says the same, and changing the
-server URL or token in Setup clears the historical count.
+server URL or token in Setup clears the historical count. While an upload or
+registration failure is *current* (wrong token, dead tailnet, server down), an
+amber line names the cause and clears itself on the next successful upload.
 
 **Build facts:** `minSdk 26`, `targetSdk 35`, `compileSdk 35`, version `1.0.0`.
 The app runs on Android 8+, is hardened for Android 14/15, and does not back up
@@ -187,10 +189,10 @@ method are in [`AUDIT.md`](AUDIT.md) and [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 | Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **21 passed, 0 failed** |
 | Collector lints | `cargo clippy --offline -- -D warnings` | **exit 0** |
 | Legacy collector | `node server/smoke_test.js` | **SMOKE OK** |
-| Android suite | `gradle :app:testDebugUnitTest --offline` | **65 tests, 0 failures, 0 skipped** |
+| Android suite | `gradle :app:testDebugUnitTest --offline` | **66 tests, 0 failures, 0 skipped** |
 | Connection | `python3 termux/dashboard.py --doctor` | **exit 0**, live counts |
 | Failure modes | wrong token / dead collector | **exit 3 / exit 2**, no crash |
-| APK | `:app:assembleDebug` | 7,400,129 bytes, `sha256 0fb30291…645a4` |
+| APK | `:app:assembleDebug` | 7,400,169 bytes, `sha256 5d25b251…c99ca` |
 
 The Android suite includes real `onAccessibilityEvent` and
 `onNotificationPosted` calls under Robolectric API 34, plus four tests that

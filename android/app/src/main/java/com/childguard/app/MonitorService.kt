@@ -72,6 +72,42 @@ class MonitorService : Service() {
             return "$what rejected by the server$http. Check the server URL and token in Setup."
         }
 
+        internal const val KEY_UPLOAD_ERROR = "last_upload_error"
+        internal const val KEY_UPLOAD_ERROR_AT = "last_upload_error_at"
+
+        /** Remember the current upload problem (auth, DNS, timeout, …). */
+        internal fun noteUploadError(sp: SharedPreferences, message: String, at: Long) {
+            sp.edit()
+                .putString(KEY_UPLOAD_ERROR, message)
+                .putLong(KEY_UPLOAD_ERROR_AT, at)
+                .apply()
+        }
+
+        /** The problem is over (any server answer that is not a config error). */
+        internal fun clearUploadError(sp: SharedPreferences) {
+            if (!sp.contains(KEY_UPLOAD_ERROR) && !sp.contains(KEY_UPLOAD_ERROR_AT)) return
+            sp.edit()
+                .remove(KEY_UPLOAD_ERROR)
+                .remove(KEY_UPLOAD_ERROR_AT)
+                .apply()
+        }
+
+        /** Parent-facing line for the current upload problem, or null. */
+        internal fun uploadWarning(sp: SharedPreferences): String? {
+            val message = sp.getString(KEY_UPLOAD_ERROR, "").orEmpty()
+            if (message.isEmpty()) return null
+            val at = sp.getLong(KEY_UPLOAD_ERROR_AT, 0L)
+            val since = if (at > 0) {
+                val clock = java.text.SimpleDateFormat(
+                    "HH:mm", java.util.Locale.getDefault()
+                ).format(java.util.Date(at))
+                " since $clock"
+            } else {
+                ""
+            }
+            return "Uploads failing$since — $message. Retrying automatically."
+        }
+
         /** Foreground-notification text; includes the loss count when known. */
         internal fun notificationText(sp: SharedPreferences): String {
             val total = sp.getInt(KEY_DROPPED_EVENTS, 0)
@@ -389,6 +425,7 @@ class MonitorService : Service() {
             sp.getString(ChildGuardApp.KEY_SERVER_URL, ChildGuardApp.DEFAULT_SERVER) ?: ""
         ) ?: run {
             Log.w(TAG, "invalid server URL configured; keeping events for retry")
+            noteUploadError(sp, "invalid server URL in Setup", System.currentTimeMillis())
             requeue(merged)
             return nextFailureDelay()
         }
@@ -415,6 +452,7 @@ class MonitorService : Service() {
 
             if (code in 200..299) {
                 consecutiveFailures = 0
+                clearUploadError(sp)
                 // Recover batch size after an earlier 413.
                 if (batchLimit < MAX_BATCH) batchLimit = minOf(MAX_BATCH, batchLimit * 2)
                 return UPLOAD_INTERVAL_MS
@@ -422,6 +460,9 @@ class MonitorService : Service() {
 
             if (code == 413) {
                 // Body too large: shrink and resend soon. Evidence is kept.
+                // The server is reachable, so the current outage marker (if
+                // any) is stale.
+                clearUploadError(sp)
                 if (merged.size > MIN_BATCH) {
                     batchLimit = maxOf(MIN_BATCH, merged.size / 2)
                     requeue(merged)
@@ -437,6 +478,7 @@ class MonitorService : Service() {
             if (code == 400 || code == 422) {
                 // Isolate the poison event: halve until one event remains,
                 // so good events on either side still reach the collector.
+                clearUploadError(sp)
                 if (merged.size > 1) {
                     val half = merged.size / 2
                     requeue(merged.subList(0, half))
@@ -451,6 +493,7 @@ class MonitorService : Service() {
             }
 
             if (isPermanentFailure(code)) {
+                clearUploadError(sp)
                 recordDropped(merged.size, code)
                 consecutiveFailures = 0
                 return UPLOAD_INTERVAL_MS
@@ -459,10 +502,13 @@ class MonitorService : Service() {
             // 401/403/404/408/429/5xx and anything unknown: the same payload
             // may succeed once the token, URL, or server recovers.
             Log.w(TAG, "upload failed code=$code; retrying with backoff")
+            noteUploadError(sp, "server answered HTTP $code", System.currentTimeMillis())
             requeue(merged)
             return nextFailureDelay()
         } catch (e: Exception) {
             Log.w(TAG, "upload error: ${e.message}; retrying with backoff")
+            noteUploadError(sp, "cannot reach the server (${e.javaClass.simpleName})",
+                System.currentTimeMillis())
             requeue(merged)
             return nextFailureDelay()
         }
@@ -539,6 +585,8 @@ class MonitorService : Service() {
                 // The parent sees "Monitoring: ON" with no uploads; at least
                 // adb logcat and bug reports now name the reason.
                 Log.w(TAG, "registration rejected with $code; events stay queued")
+                noteUploadError(sp, "registration rejected (HTTP $code) — check the token",
+                    System.currentTimeMillis())
                 return null
             }
             val text = readAtMost(opened.inputStream, 8 * 1024)
@@ -555,6 +603,8 @@ class MonitorService : Service() {
             return childId
         } catch (e: Exception) {
             Log.w(TAG, "registration error: ${e.message}")
+            noteUploadError(sp, "cannot reach the server to register (${e.javaClass.simpleName})",
+                System.currentTimeMillis())
         } finally {
             conn?.disconnect()
         }

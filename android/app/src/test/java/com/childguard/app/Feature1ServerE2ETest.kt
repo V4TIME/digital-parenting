@@ -6,6 +6,7 @@ import android.view.accessibility.AccessibilityEvent
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Before
@@ -187,7 +188,19 @@ class Feature1ServerE2ETest {
             "retried events keep their payload",
             retried.any { it.optString("type") == "stranger_alert" }
         )
+        // "Monitoring: ON" with no data is indistinguishable from an empty
+        // day. The failure must be visible on the dashboard while it lasts.
+        val warning = MonitorService.uploadWarning(prefs())
+        assertNotNull("a failed upload must be visible", warning)
+        assertTrue("warning must name the cause: $warning",
+            warning!!.contains("cannot reach") || warning.contains("HTTP"))
+
+        // Retrying automatically means a recovery clears the warning.
+        MonitorService.requeue(retried)
         prefs().edit().putString(ChildGuardApp.KEY_SERVER_URL, server).apply()
+        uploadLikeTheApp()
+        assertNull("a successful upload must clear the warning",
+            MonitorService.uploadWarning(prefs()))
     }
 
     @Test

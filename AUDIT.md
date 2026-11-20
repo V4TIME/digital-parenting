@@ -100,6 +100,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-71 | low | Dashboard | Sync copied the server's timestamp by type only: `int(float(raw))`. Both collectors treat `0`/negative/missing as "now" and clamp clock skew to +1 h, but the dashboard stored `0` as **1970** (sorted below every real event and ruining screen-time windows) and a JSON `1e400` (Python `inf`) raised `OverflowError`, which the per-row `except` swallowed — the event vanished. | `try: int(float(raw)) except (TypeError, ValueError): now` | **Fixed 2026-11-20** — the same policy as Rust/Node: non-finite or `<= 0` ⇒ `now`, future values clamped to `now + 1 h`; `test_sync_sanitizes_zero_negative_and_future_timestamps` (old code stores 3 of 4 rows) |
 | F-72 | low | Dashboard | Export names used `time.strftime("%Y%m%d-%H%M%S")` and `O_TRUNC`. Two exports in the same second — a retry, a double invocation, or two shells — silently overwrote the first bundle, and the staging `.jsonl` names could collide between concurrent runs. | second-resolution name + `O_TRUNC`, fixed `events_{stamp}.jsonl` names | **Fixed 2026-11-20** — the bundle is claimed atomically with `O_EXCL` (`name.tar.gz`, `name-2.tar.gz`, …) and staging files use `tempfile.mkstemp`; a failed export removes the partial bundle and closes its fd. `test_two_exports_in_the_same_second_do_not_overwrite` (old code leaves 1 bundle) |
 | F-73 | low | Rust collector | An oversized header region was answered with **413 Payload Too Large**, and the read loop did not enforce the 64 KiB header budget while waiting for `\r\n\r\n`: it buffered up to `MAX_BODY + 64 KiB` (~2.1 MiB) and, with a client that keeps writing, held the connection until the 30 s deadline. Node's HTTP parser answers 431 at its 16 KiB limit, so the collectors also disagreed. | `split > MAX_HEADER_REGION ⇒ 413`, no early cap | **Fixed 2026-11-20** — the loop returns `431` as soon as the unterminated header region exceeds 64 KiB, and a terminated oversized block is `431`; the reason phrase and log text were added. Tests `an_oversized_header_block_is_431_not_413` and `an_unterminated_header_flood_is_431_without_buffering_the_body_cap` (old code: 413 and a 10 s 408). Live: 70 KiB headers → `431` in 1.9 ms / 1.6 ms; valid request → `200` |
+| F-74 | medium | Android | A wrong token, a dead tailnet, or an unreachable collector left the dashboard at "Monitoring: ON" with **no uploads and no message**. `ensureRegistered`/upload failures only wrote `Log.w`; events were correctly kept for retry, but the parent had no way to distinguish "nothing happened" from "nothing is arriving". | failures logged only; warning state did not exist | **Fixed 2026-11-20** — the current upload problem is persisted (`last_upload_error` + timestamp) and shown as an amber dashboard line ("Uploads failing since 12:04 — server answered HTTP 401. Retrying automatically."); it is cleared by any 2xx or reachable-but-rejected batch, and the same marker covers registration failures. Tests: `currentUploadProblemIsVisibleAndClearsWhenFixed`; the live E2E dead-port test now asserts the warning appears and clears after recovery |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -972,6 +973,43 @@ an_oversized_header_block_is_431_not_413            FAILED  left: 431  right: 41
 an_unterminated_header_flood_is_431_without_...     FAILED  left: 431  right: 408  (10.24 s)
 ```
 
+## 5u. Daily audit — 2026-11-20, outage visibility pass
+
+Feature 1's promise is that captured events reach the parent. The failure mode
+this pass closes is the quiet one: the app is running, the queue is filling,
+and the screen still says everything is fine.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Upload/registration errors | Only `Log.w` | Persisted current error + dashboard line | Robolectric UI test + live E2E |
+| Recovery | No state to clear | Any 2xx or reachable rejection clears it | E2E: dead port → warning, live server → null |
+| Permanent rejections | Already visible (F-69) | Kept separate from transient outages | existing tests |
+
+Why these shapes:
+
+- **Current state, not a log.** The line describes *now* ("Uploads failing…")
+  and disappears on the next success, so a parent is not trained to ignore a
+  warning that is years old. Permanent losses keep their own durable counter
+  (F-69) because those events never come back.
+- **Retrying automatically is part of the message.** Without it a red-ish line
+  reads as "fix something", when the correct action may be to wait. The line
+  names the HTTP status or the failure class so a bug report is actionable.
+- **Registration is an upload failure too.** A 401 on `/api/register` means
+  zero events will ever be sent; treating only `/api/events` as the failure
+  would miss the most common misconfiguration (wrong token).
+- **Reachable-but-rejected clears the outage marker.** A 400/413/415/422 is a
+  payload problem, not a connectivity one; the drop/split logic reports it
+  separately. Keeping "cannot reach the server" while the server is answering
+  would be false.
+
+Live E2E (`Feature1ServerE2ETest`, real `MonitorService` and real HTTP):
+
+```
+dead port  -> warning = "Uploads failing since 01:xx — cannot reach the server
+                          to register (ConnectException). Retrying automatically."
+live server-> uploadWarning(prefs) = null
+```
+
 ## 6. Verification log (this audit)
 
 ```
@@ -980,15 +1018,15 @@ server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,
               LRU eviction, field clipping, stream limit, liveness)
-android:      65 tests, 0 failures, 0 skipped (with live server)
+android:      66 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 8,
-              DashboardActivity 5, MonitorServiceLifecycle 6,
+              DashboardActivity 6, MonitorServiceLifecycle 6,
               SetupActivity 4, WebMonitorActivity 1
 dashboard:    python3 -m unittest termux/test_dashboard.py → 21 passed
-android:      assembleDebug → app-debug.apk 7,400,129 bytes,
-              sha256 0fb30291...645a4
+android:      assembleDebug → app-debug.apk 7,400,169 bytes,
+              sha256 5d25b251...c99ca
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";
