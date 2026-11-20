@@ -18,7 +18,16 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textSize="16sp"
-        android:paddingBottom="24dp" />
+        android:paddingBottom="12dp" />
+
+    <TextView
+        android:id="@+id/tv_dropped"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="14sp"
+        android:textColor="#B00020"
+        android:visibility="gone"
+        android:paddingBottom="12dp" />
 
     <Button
         android:id="@+id/btn_toggle"

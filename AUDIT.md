@@ -95,6 +95,8 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-66 | low | Node collector | `limit` disagreed with the Rust collector. `parseInt` accepted `5.9` as 5 and `12abc` as 12, and `limit=0` returned the **default 200** instead of none, because the default check treated 0 as "unset". Rust returns 0 events for `limit=0` and falls back for non-numeric values, so the same request returned different data depending on which collector was running. | `parseInt(raw, 10)` + `n <= 0 ⇒ fallback` | **Fixed 2026-11-20** — only ASCII digits are accepted, `Number.isSafeInteger` rejects overflow, and `tail()` handles 0 explicitly because `slice(-0)` returns the whole list; smoke test covers `0`, `5.9` and `1`; live side-by-side (Rust 38080 / Node 38081) now identical for `0, 2, 5.9, abc, -1` |
 | F-67 | medium | All | Registration had no client identity: `/api/register` always minted a fresh `cg_…` id. If the reply was lost (10 s timeout, app killed, flaky tailnet), `ensureRegistered` retried and the collector created **another child**. One phone then appears as N children in `--doctor`/`stats`; at the 2,000 cap the LRU starts evicting real children, and every phantom id inflates `state.json`. | Rust `let id = uid("cg")`, Node `bumpChild(uid(), name)`, Android POSTed only `{name}` | **Fixed 2026-11-20** — the app generates and persists a `pending_child_id` **before** the POST and sends it; both collectors accept a supplied `childId` (clipped to 128 B) and treat a re-register as a touch. Older clients that omit it still get a generated id. Tests: `registering_with_a_client_supplied_id_is_idempotent`, `supplied_child_id_is_clipped_like_an_event_id`, Node smoke 7e. Live same-binary probe: two id-less registers → 2 children; two with `cg_phone_1` → 1 child |
 | F-68 | low | Android | Registration read its reply with `bufferedReader().readText()`, with no size limit. A proxy or broken server answering 200 with a large page buffered it all into the app heap. | unbounded `readText()` | **Fixed 2026-11-20** — `readAtMost(input, 8 KiB)`; a malformed 200 now keeps the pending id and retries instead of being trusted; non-200 outcomes are logged with the status; `registrationResponseReadIsBounded` |
+| F-69 | medium | Android | Events the server permanently rejected (`400`/`415`/`422`, after the batch was split down to the single poison event) were dropped, and the app incremented `dropped_events_total` — which **nothing ever read**. The dashboard kept saying "Monitoring: ON" while captured evidence disappeared, so a parent had no way to learn that the endpoint or token was wrong. | `recordDropped()` wrote a pref; no reader | **Fixed 2026-11-20** — the dashboard shows a red `tv_dropped` line (`"3 events were rejected by the server (HTTP 400). Check the server URL and token in Setup."`), refreshed on every resume; the ongoing notification is re-posted with the count; changing the server URL or token in Setup clears the historical count. Tests: `rejectedEventsAreVisibleOnTheDashboard`, `droppedCounterAccumulatesAndReadsNaturally`, `notificationSurfacesRejectedEvents`, `changingTheEndpointClearsTheStaleLossCounter` |
+| F-70 | medium | Android | The upload loop was a single self-posting `Runnable` that re-armed via the `uploadHandler` **field**. `stopUploadLoop()` used `quitSafely()`, so a pass already running finished after `stop` and then posted itself onto the *new* loop's handler. Every STOP→START added another permanent chain: two, three, … full batches hitting the collector every 15 s, with duplicate uploads and extra radio wake-ups. | single `uploadRunnable` + `uploadHandler?.postDelayed(this, delay)` | **Fixed 2026-11-20** — each loop captures its own `Handler` and a `@Volatile` generation; a pass from a dead generation returns without rescheduling. `restartingTheLoopDoesNotDoubleTheUploadRate` fails on the old shape (`expected:<1> but was:<2>`) and passes on the fix |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -833,6 +835,60 @@ new client shape (childId=cg_phone_1):
 Android keeps the id across a lost response: the pref is written before the
 POST and removed only after a 200 that contains a `childId`.
 
+## 5r. Daily audit — 2026-11-20, silent-loss visibility and upload loop
+
+Two Android defects with the same theme: the app kept running while something
+important had quietly stopped working.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Rejected events | Counter written, never read | Dashboard line + notification + Setup reset | 6 new tests |
+| Stop/start loop | In-flight pass re-armed the new handler | Per-loop handler + generation | test fails pre-fix (`1` vs `2`) |
+
+Why these shapes:
+
+- **A counter nobody reads is the same as no counter.** The 400/415/422 path
+  isolates the poison event by halving the batch; when one event remains it is
+  discarded. That is the right call for one malformed record, but it must be
+  *visible*. The warning is durable (per install) and names the HTTP status,
+  because "events were lost" without a reason gives the parent nothing to fix.
+- **The notification is the only surface guaranteed to be seen.** A parent
+  installs the app once and rarely opens it. Re-posting the ongoing
+  notification on each rejection is a handful of bytes and no extra channel.
+- **Clearing on endpoint change is deliberate.** After the parent changes the
+  URL or token (the action the warning asks for), the old count describes a
+  configuration that no longer exists and would nag forever. Re-saving the
+  same values keeps it, so a parent cannot dismiss the warning by tapping
+  Finish.
+- **A loop must own its scheduler.** With `quitSafely()` the old pass cannot
+  be cancelled, so the only safe rule is that a pass may reschedule *its own*
+  handler and only while its generation is current. Capturing the handler
+  removes the field race; the `@Volatile` generation removes the logical race.
+
+Proof of the loop bug, running the new test against the old shape (temporarily
+restored):
+
+```
+restartingTheLoopDoesNotDoubleTheUploadRate FAILED
+java.lang.AssertionError: a stale pass must not schedule a second chain
+    expected:<1> but was:<2>
+```
+
+and against the fix:
+
+```
+MonitorServiceLifecycleTest  tests=6 failures=0
+```
+
+Live dashboard surface (Robolectric, real `DashboardActivity`), with
+`dropped_events_total=3`, `last_rejection_code=400`:
+
+```
+tv_dropped.visibility = VISIBLE
+tv_dropped.text = "3 events were rejected by the server (HTTP 400).
+                   Check the server URL and token in Setup."
+```
+
 ## 6. Verification log (this audit)
 
 ```
@@ -841,15 +897,15 @@ server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,
               LRU eviction, field clipping, stream limit, liveness)
-android:      58 tests, 0 failures, 0 skipped (with live server)
+android:      65 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 8,
-              DashboardActivity 2, MonitorServiceLifecycle 4,
-              SetupActivity 2, WebMonitorActivity 1
+              DashboardActivity 5, MonitorServiceLifecycle 6,
+              SetupActivity 4, WebMonitorActivity 1
 dashboard:    python3 -m unittest termux/test_dashboard.py → 19 passed
-android:      assembleDebug → app-debug.apk 7,400,089 bytes,
-              sha256 93eddba1...bb470
+android:      assembleDebug → app-debug.apk 7,400,129 bytes,
+              sha256 0fb30291...645a4
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";

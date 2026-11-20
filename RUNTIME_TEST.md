@@ -13,10 +13,10 @@ Two layers of proof, plus the small part that needs a real phone.
 | `Feature1RuntimeTest` (11) | **`onAccessibilityEvent` → `eventQueue`** on the real service, scroll subscription, password events ignored, chat-only fallback dedupe | Robolectric API 34 |
 | `Feature3NotificationTest` (11) | **`onNotificationPosted` → queue**, alert precision, chat-only allowlist, re-post dedupe, queue cap, text bound | Robolectric API 34 |
 | `Feature1ServerE2ETest` (4) | **`eventQueue` → `MonitorService` upload → server** | Robolectric API 34 + live server |
-| `DashboardActivityTest` (2) | **"Monitoring: ON" actually starts `MonitorService`** (first-run flow), and OFF does not | Robolectric API 34 |
-| `MonitorServiceLifecycleTest` (4) | explicit STOP is not sticky; a null-intent system restart resumes or stops cleanly | Robolectric API 34 |
+| `DashboardActivityTest` (5) | **"Monitoring: ON" actually starts `MonitorService`** (first-run flow), OFF does not, and permanently rejected events are shown (and cleared on endpoint change) | Robolectric API 34 |
+| `MonitorServiceLifecycleTest` (6) | explicit STOP is not sticky; a null-intent system restart resumes or stops cleanly; a stop/start cannot double the upload rate; the notification names rejected events | Robolectric API 34 |
 | `WebMonitorActivityTest` (1) | the internet-app scan lists a real `INTERNET` app via one `getInstalledPackages` call, off the UI thread | Robolectric API 34 |
-| `SetupActivityTest` (2) | a scheme-less URL is saved as `http://…`; a non-http URL shows an inline error and does not replace the saved endpoint | Robolectric API 34 |
+| `SetupActivityTest` (4) | a scheme-less URL is saved as `http://…`; a non-http URL shows an inline error; changing the endpoint clears the stale loss counter, re-saving it does not | Robolectric API 34 |
 
 ```bash
 cd android
@@ -33,7 +33,7 @@ CHILDGUARD_SERVER=http://127.0.0.1:38080 CHILDGUARD_TOKEN=testsecret \
   gradle :app:cleanTestDebugUnitTest :app:testDebugUnitTest --tests "*Feature1ServerE2ETest"
 ```
 
-Last run: **58 tests, 0 failures, 0 skipped** (live collector; the 4 E2E tests
+Last run: **65 tests, 0 failures, 0 skipped** (live collector; the 4 E2E tests
 skip when no server is configured).
 
 ### What `Feature1RuntimeTest` drives

@@ -3,6 +3,7 @@ package com.childguard.app
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -54,6 +55,21 @@ class DashboardActivity : AppCompatActivity() {
 
         btnOpen.setOnClickListener {
             startActivity(Intent(this, WebMonitorActivity::class.java))
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Uploads run in a background thread while this screen is open, so
+        // re-read on every resume instead of only in onCreate.
+        val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
+        val tvDropped = findViewById<TextView>(R.id.tv_dropped)
+        val warning = MonitorService.droppedWarning(sp)
+        if (warning == null) {
+            tvDropped.visibility = View.GONE
+        } else {
+            tvDropped.text = warning
+            tvDropped.visibility = View.VISIBLE
         }
     }
 }

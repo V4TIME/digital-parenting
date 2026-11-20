@@ -50,11 +50,22 @@ class SetupActivity : AppCompatActivity() {
                 ).show()
                 return@setOnClickListener
             }
-            prefs.edit()
+            val editor = prefs.edit()
                 .putString(ChildGuardApp.KEY_SERVER_URL, normalized)
                 .putString(ChildGuardApp.KEY_PARENT_TOKEN, token)
                 .putBoolean("setup_done", true)
-                .apply()
+            // The dashboard warning asks the parent to check the endpoint.
+            // Once the endpoint (or token) actually changes, the old loss
+            // count describes a configuration that no longer exists, so it
+            // would nag forever with no action left to take. Re-saving the
+            // same values keeps the record.
+            if (normalized != prefs.getString(ChildGuardApp.KEY_SERVER_URL, null) ||
+                token != prefs.getString(ChildGuardApp.KEY_PARENT_TOKEN, null)
+            ) {
+                editor.remove(MonitorService.KEY_DROPPED_EVENTS)
+                editor.remove(MonitorService.KEY_LAST_REJECTION)
+            }
+            editor.apply()
             startActivity(Intent(this, DashboardActivity::class.java))
             finish()
         }

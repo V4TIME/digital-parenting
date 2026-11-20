@@ -62,4 +62,65 @@ class DashboardActivityTest {
 
         assertNull("a stopped monitor must not be restarted", shadowOf(app).nextStartedService)
     }
+
+    @Test
+    fun rejectedEventsAreVisibleOnTheDashboard() {
+        // Permanent 400/415/422 rejections dropped the evidence while the
+        // screen still said "Monitoring: ON". The count was written but no
+        // screen ever read it.
+        prefs.edit().putBoolean(ChildGuardApp.KEY_MONITORING, false).apply()
+        MonitorService.noteDroppedEvents(prefs, 3, 400)
+
+        val controller = Robolectric.buildActivity(DashboardActivity::class.java)
+            .create().start().resume()
+        val activity = controller.get()
+        val tv = activity.findViewById<android.widget.TextView>(R.id.tv_dropped)
+
+        assertEquals(android.view.View.VISIBLE, tv.visibility)
+        assertTrue("must name the loss count: ${tv.text}", tv.text.contains("3 events"))
+        assertTrue("must name the server answer: ${tv.text}", tv.text.contains("HTTP 400"))
+
+        // Another rejection while the screen is already open must show up on
+        // the next resume, not only after an app restart.
+        MonitorService.noteDroppedEvents(prefs, 2, 422)
+        controller.pause().resume()
+        assertTrue(
+            "dashboard must re-read the counter: ${tv.text}",
+            tv.text.contains("5 events") && tv.text.contains("HTTP 422")
+        )
+    }
+
+    @Test
+    fun noWarningWhenNothingWasRejected() {
+        prefs.edit().putBoolean(ChildGuardApp.KEY_MONITORING, false).apply()
+        prefs.edit()
+            .putInt(MonitorService.KEY_DROPPED_EVENTS, 0)
+            .putInt(MonitorService.KEY_LAST_REJECTION, 0)
+            .apply()
+
+        val activity = Robolectric.buildActivity(DashboardActivity::class.java)
+            .create().start().resume().get()
+        val tv = activity.findViewById<android.widget.TextView>(R.id.tv_dropped)
+
+        assertEquals(android.view.View.GONE, tv.visibility)
+        assertNull(MonitorService.droppedWarning(prefs))
+        assertEquals(
+            "Monitoring chats & notifications",
+            MonitorService.notificationText(prefs)
+        )
+    }
+
+    @Test
+    fun droppedCounterAccumulatesAndReadsNaturally() {
+        MonitorService.noteDroppedEvents(prefs, 1, 422)
+        assertEquals("1 event was rejected by the server (HTTP 422). Check the server URL and token in Setup.",
+            MonitorService.droppedWarning(prefs))
+        MonitorService.noteDroppedEvents(prefs, 2, 400)
+        assertEquals("3 events were rejected by the server (HTTP 400). Check the server URL and token in Setup.",
+            MonitorService.droppedWarning(prefs))
+        assertEquals(
+            "3 event(s) rejected by server — open the dashboard",
+            MonitorService.notificationText(prefs)
+        )
+    }
 }

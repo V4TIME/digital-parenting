@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -40,7 +41,43 @@ class MonitorService : Service() {
         private const val MAX_BATCH = 250
         private const val MIN_BATCH = 25
         internal const val MAX_BACKOFF_MS = 300_000L
-        private const val KEY_DROPPED_EVENTS = "dropped_events_total"
+        internal const val KEY_DROPPED_EVENTS = "dropped_events_total"
+        internal const val KEY_LAST_REJECTION = "last_rejection_code"
+
+        /**
+         * Count a permanent rejection so it is visible to the parent.
+         *
+         * The server returns 400/415/422 when it will never accept a body.
+         * Those events are gone once the batch is split down to one, but the
+         * count used to be written and never read: monitoring still showed
+         * "ON" while captured evidence disappeared silently.
+         */
+        internal fun noteDroppedEvents(sp: SharedPreferences, count: Int, code: Int): Int {
+            val total = sp.getInt(KEY_DROPPED_EVENTS, 0).coerceAtLeast(0) +
+                count.coerceAtLeast(0)
+            sp.edit()
+                .putInt(KEY_DROPPED_EVENTS, total)
+                .putInt(KEY_LAST_REJECTION, code)
+                .apply()
+            return total
+        }
+
+        /** Parent-facing warning, or null when nothing has been lost. */
+        internal fun droppedWarning(sp: SharedPreferences): String? {
+            val total = sp.getInt(KEY_DROPPED_EVENTS, 0)
+            if (total <= 0) return null
+            val code = sp.getInt(KEY_LAST_REJECTION, 0)
+            val http = if (code > 0) " (HTTP $code)" else ""
+            val what = if (total == 1) "1 event was" else "$total events were"
+            return "$what rejected by the server$http. Check the server URL and token in Setup."
+        }
+
+        /** Foreground-notification text; includes the loss count when known. */
+        internal fun notificationText(sp: SharedPreferences): String {
+            val total = sp.getInt(KEY_DROPPED_EVENTS, 0)
+            if (total <= 0) return "Monitoring chats & notifications"
+            return "$total event(s) rejected by server — open the dashboard"
+        }
 
         /**
          * Statuses where resending the same body cannot succeed. 400/422 are
@@ -204,22 +241,12 @@ class MonitorService : Service() {
 
     private var uploadThread: HandlerThread? = null
     private var uploadHandler: Handler? = null
+    private var uploadRunnable: Runnable? = null
+    @Volatile private var uploadGeneration = 0
 
     // Only touched from the single upload HandlerThread.
     private var consecutiveFailures = 0
     private var batchLimit = MAX_BATCH
-
-    private val uploadRunnable = object : Runnable {
-        override fun run() {
-            val delay = try {
-                uploadQueuedEvents()
-            } catch (t: Throwable) {
-                Log.w(TAG, "upload pass failed", t)
-                backoffDelayMs(++consecutiveFailures)
-            }
-            uploadHandler?.postDelayed(this, delay)
-        }
-    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -279,10 +306,19 @@ class MonitorService : Service() {
             nm.createNotificationChannel(channel)
         }
 
-        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val notification = buildNotification(
+            notificationText(getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE))
+        )
+
+        startForeground(NOTIF_ID, notification)
+    }
+
+    /** One notification shape for start and for loss updates. */
+    private fun buildNotification(text: String): Notification {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("ChildGuard is protecting")
-                .setContentText("Monitoring chats & notifications")
+                .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .setOngoing(true)
                 .build()
@@ -290,24 +326,46 @@ class MonitorService : Service() {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
                 .setContentTitle("ChildGuard is protecting")
-                .setContentText("Monitoring chats & notifications")
+                .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .build()
         }
-
-        startForeground(NOTIF_ID, notification)
     }
 
     private fun startUploadLoop() {
         if (uploadThread != null) return
+        // Every loop gets a generation. A pass that was still running when the
+        // service was stopped and restarted must not schedule itself onto the
+        // new handler, or each restart adds another self-perpetuating chain
+        // and the phone uploads at 2x, 3x, ... the intended rate.
+        val generation = ++uploadGeneration
         uploadThread = HandlerThread("childguard-upload").also { it.start() }
-        uploadHandler = Handler(uploadThread!!.looper)
-        uploadHandler?.postDelayed(uploadRunnable, UPLOAD_INTERVAL_MS)
+        val handler = Handler(uploadThread!!.looper)
+        uploadHandler = handler
+        val runnable = object : Runnable {
+            override fun run() {
+                if (generation != uploadGeneration) return
+                val delay = try {
+                    uploadQueuedEvents()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "upload pass failed", t)
+                    backoffDelayMs(++consecutiveFailures)
+                }
+                if (generation == uploadGeneration) handler.postDelayed(this, delay)
+            }
+        }
+        uploadRunnable = runnable
+        handler.postDelayed(runnable, UPLOAD_INTERVAL_MS)
     }
 
     private fun stopUploadLoop() {
-        uploadHandler?.removeCallbacks(uploadRunnable)
+        // Invalidate the current pass before removing the queued one.
+        uploadGeneration += 1
+        val handler = uploadHandler
+        val runnable = uploadRunnable
+        if (handler != null && runnable != null) handler.removeCallbacks(runnable)
         uploadHandler = null
+        uploadRunnable = null
         uploadThread?.quitSafely()
         uploadThread = null
     }
@@ -417,9 +475,24 @@ class MonitorService : Service() {
 
     private fun recordDropped(count: Int, code: Int) {
         val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
-        val total = sp.getInt(KEY_DROPPED_EVENTS, 0) + count
-        sp.edit().putInt(KEY_DROPPED_EVENTS, total).apply()
+        val total = noteDroppedEvents(sp, count, code)
         Log.w(TAG, "server rejected $count event(s) with $code; dropped, total=$total")
+        // Make the loss visible even if the parent never opens the app.
+        refreshNotification()
+    }
+
+    /** Re-post the ongoing notification with the current loss count. */
+    private fun refreshNotification() {
+        // A pass can still be in flight when the parent stops monitoring;
+        // do not resurrect the notification after stopForeground().
+        if (!isMonitoring) return
+        // The upload thread owns this call; a notification failure must never
+        // be mistaken for an upload failure and trigger a retry/backoff.
+        runCatching {
+            val sp = getSharedPreferences(ChildGuardApp.PREFS, MODE_PRIVATE)
+            val nm = getSystemService(NotificationManager::class.java) ?: return
+            nm.notify(NOTIF_ID, buildNotification(notificationText(sp)))
+        }.onFailure { Log.w(TAG, "could not update loss notification: ${it.message}") }
     }
 
     /**

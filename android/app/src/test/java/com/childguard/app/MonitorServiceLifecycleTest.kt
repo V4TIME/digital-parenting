@@ -74,4 +74,68 @@ class MonitorServiceLifecycleTest {
         assertEquals(Service.START_NOT_STICKY, start(null))
         assertFalse(MonitorService.isMonitoring)
     }
+
+    @Test
+    fun restartingTheLoopDoesNotDoubleTheUploadRate() {
+        // stop() quitSafely()s the thread but a pass already running finishes
+        // afterwards. It used to post itself onto whatever handler the field
+        // pointed at by then — the NEW loop's handler. Every stop/start added
+        // another upload chain in parallel.
+        start("childguard.START")
+        val stale = privateField("uploadRunnable") as Runnable
+        start("childguard.STOP")
+        start("childguard.START")
+
+        val handler = privateField("uploadHandler") as android.os.Handler
+        val before = pendingMessages(handler)
+        assertEquals("the fresh loop schedules exactly one pass", 1, before)
+
+        stale.run() // the old thread finishing its last pass
+        assertEquals(
+            "a stale pass must not schedule a second chain",
+            before,
+            pendingMessages(handler)
+        )
+    }
+
+    /** Messages waiting on a paused looper (PAUSED mode has no Scheduler API). */
+    private fun pendingMessages(handler: android.os.Handler): Int {
+        val queue = handler.looper.queue
+        val head = queue.javaClass.getDeclaredField("mMessages").apply { isAccessible = true }
+        val next = android.os.Message::class.java.getDeclaredField("next")
+            .apply { isAccessible = true }
+        var msg = head.get(queue) as? android.os.Message
+        var count = 0
+        while (msg != null) {
+            count += 1
+            msg = next.get(msg) as? android.os.Message
+        }
+        return count
+    }
+
+    private fun privateField(name: String): Any? =
+        MonitorService::class.java.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(service)
+
+    @Test
+    fun notificationSurfacesRejectedEvents() {
+        // A parent may never open the app. The ongoing notification is the
+        // only place a permanent server rejection can be seen in time.
+        prefs.edit()
+            .putInt(MonitorService.KEY_DROPPED_EVENTS, 4)
+            .putInt(MonitorService.KEY_LAST_REJECTION, 400)
+            .apply()
+        start("childguard.START")
+
+        val nm = RuntimeEnvironment.getApplication()
+            .getSystemService(android.app.NotificationManager::class.java)
+        val texts = org.robolectric.Shadows.shadowOf(nm).allNotifications.map {
+            it.extras.getCharSequence(android.app.Notification.EXTRA_TEXT)?.toString().orEmpty()
+        }
+        assertTrue(
+            "notification must mention the refused events: $texts",
+            texts.any { it.contains("4 event") && it.contains("rejected") }
+        )
+    }
 }
