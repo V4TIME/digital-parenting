@@ -90,6 +90,8 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-61 | medium | Dashboard | `sync_from_server` trusted the response shape. A bare list, `{"events": null}`, or a row that is not an object (`null`, `1`) raised `AttributeError` from `_clean_id(ev, "e")` **outside** the per-row guard, aborting the entire sync before `LAST_SYNC` was written. `--doctor` likewise iterated `children` and called `c.get("online")` on strings/null. | `ev_resp.get("events", [])` then `ev.get("id")`; `sum(1 for c in children if c.get("online"))` | **Fixed 2026-11-19** — `_response_list` validates the envelope, non-dict rows are skipped, and doctor filters non-dict children; three tests drive a fake server with those exact shapes. Live: `Sync complete: 2 new records`, `--logs kept` shows the valid row, `doctor: healthy` (1 child) exit 0 |
 | F-62 | high | Rust server | The persistence thread cleared `dirty` **before** writing the snapshot. If the write then failed (disk full, read-only mount, permissions), the flag stayed clear and the collector stopped persisting entirely until the *next* request mutated state; events already accepted were lost on restart with no retry. It also marked a mutation that landed *during* the write as clean, so that event could be dropped forever. | `st.dirty = false; snapshot(&st)` then `write_snapshot(...)` ignoring the result | **Fixed 2026-11-19** — every mutation goes through `mark_dirty()` (increments `generation`); `write_snapshot` returns `bool`; the loop clears `dirty` only after a successful write *and* only if `snapshot_is_current()`; tests `failed_persist_is_reported_and_keeps_state_dirty`, `a_mutation_during_the_write_is_not_marked_clean`. Live: blocked data dir → 2 failed ticks, obstruction removed → state written on the next tick with no new request (dir `700`, file `600`) |
 | F-63 | medium | Rust server | Request framing trusted the sender. A repeated `Content-Length` silently used the **last** value, so `Content-Length: 2` followed by `Content-Length: 14` was framed as 14 and the request was applied; a non-numeric value became `0`; `Transfer-Encoding: chunked` was ignored (body dropped); and a body that ended before its declared length was accepted, so a truncated request still mutated state (proved: `Content-Length: 100` + `{}` + EOF registered a child). RFC 7230 §3.3.3 requires rejecting conflicting lengths and unsupported transfer codings. | `content_length = value.parse::<usize>().ok()` (last wins, `None` ⇒ 0) and `body.truncate(cl)` after `break` on EOF | **Fixed 2026-11-19** — lengths must be ASCII digits, repeated lengths must agree, any `Transfer-Encoding` is refused, and `body.len() < cl` is a `400`; tests `conflicting_duplicate_content_length_is_rejected`, `identical_duplicate_content_length_is_accepted`, `non_numeric_content_length_is_rejected`, `truncated_body_is_rejected`, `transfer_encoding_is_rejected`; live probe: four malformed shapes → `400`, identical duplicate + valid → `200`, only the two valid children stored |
+| F-64 | medium | Dashboard | Screen time was credited per package from that package's previous event. With WhatsApp 0–100 s and Instagram 100–300 s, WhatsApp got the entire 300 s span **and** Instagram got its 100 s: 400 s of screen time inside a 300 s window, shown to the parent as fact. | `last_active[pkg]`, then `min(ts - prev, max_gap)` per package | **Fixed 2026-11-19** — walk the merged timeline once and attribute each gap to the app that was on screen when it started; `test_foreground_switch_credits_only_the_app_on_screen`; pre-fix probe returned WhatsApp 300,000 ms + Instagram 100,000 ms inside a 300,000 ms window; live `--screen-time` now shows Instagram 3m, WhatsApp 1m |
+| F-65 | low | Dashboard | `pkg_name` used the last package segment, so `com.instagram.android` displayed as **Android** and `com.google.android.apps.messaging` as **Messaging** only by luck. | `pkg.split(".")[-1].capitalize()` | **Fixed 2026-11-19** — platform suffixes (`android`, `app`, `apps`, `client`, `mobile`, `beta`, `debug`) are stripped before labeling; `test_package_labels_skip_platform_segments` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -723,6 +725,42 @@ children after                -> Bob, Dee only (no phantom "Child")
 health after                  -> {"ok":true,…}
 ```
 
+## 5o. Daily audit — 2026-11-19, screen-time attribution pass
+
+The screen-time view inferred duration from event gaps, but it tracked the
+previous event **per package**. That double-counts whenever the child switches
+apps, which is the normal case.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Attribution | Each package measured against its own last event, so the next app's time was credited to the previous one | One merged timeline; each gap goes to the app active at its start | test with A 0–100 s, B 100–300 s |
+| Labels | Last dotted segment is often `android` | Strip platform suffixes | `pkg_name` test |
+
+Why these shapes:
+
+- **A gap belongs to whoever was on screen when it began.** When B's
+  `screen_active` arrives, A's session is over; B owns the time until the next
+  event. This also makes the invariant obvious: the sum of attributions can
+  never exceed the timeline.
+- **The idle cap still applies.** A gap longer than 5 minutes is idle, so a
+  child who leaves an app open overnight is not credited hours.
+- **Labels are a trust signal.** "Android 3m" tells a parent nothing and looks
+  like a bug; "Instagram 3m" is the same data stated honestly.
+
+Pre-fix probe on a 300 s timeline (WhatsApp 0–100 s, Instagram 100–300 s):
+
+```
+compute_screen_durations -> {'com.whatsapp': 300000, 'com.instagram.android': 100000}
+sum = 400000 ms inside a 300000 ms window
+```
+
+Live `--screen-time` after the fix (same synthetic rows):
+
+```
+Instagram   3m  ####
+Whatsapp    1m  ##
+```
+
 ## 6. Verification log (this audit)
 
 ```
@@ -737,7 +775,7 @@ android:      56 tests, 0 failures, 0 skipped (with live server)
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 6,
               DashboardActivity 2, MonitorServiceLifecycle 4,
               SetupActivity 2, WebMonitorActivity 1
-dashboard:    python3 -m unittest termux/test_dashboard.py → 17 passed
+dashboard:    python3 -m unittest termux/test_dashboard.py → 19 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
               sha256 d2f6679f...bf1f8d
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);

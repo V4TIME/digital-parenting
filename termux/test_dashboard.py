@@ -127,6 +127,35 @@ class ConfigPermissionTest(unittest.TestCase):
         _, tight = dd.compute_screen_durations(rows, max_gap_ms=60_000)
         self.assertEqual(30_000 + 60_000, tight["com.whatsapp"])
 
+    def test_foreground_switch_credits_only_the_app_on_screen(self):
+        dd = self._load_dashboard()
+        # A 0-100 s, B 100-300 s. The old per-package gap credited WhatsApp
+        # with the whole 300 s span *and* Instagram with its 100 s: 400 s of
+        # screen time inside a 300 s window.
+        rows = [
+            ("com.whatsapp", "screen_active", "", 0),
+            ("com.instagram.android", "screen_active", "", 100_000),
+            ("com.instagram.android", "screen_active", "", 200_000),
+            ("com.whatsapp", "screen_active", "", 300_000),
+        ]
+        total, duration = dd.compute_screen_durations(rows)
+        self.assertEqual(2, total["com.whatsapp"])
+        self.assertEqual(2, total["com.instagram.android"])
+        self.assertEqual(100_000, duration["com.whatsapp"], "0-100 s belongs to WhatsApp")
+        self.assertEqual(200_000, duration["com.instagram.android"], "100-300 s belongs to Instagram")
+        self.assertEqual(
+            300_000,
+            sum(duration.values()),
+            "attributed time must equal the timeline, never more",
+        )
+
+    def test_package_labels_skip_platform_segments(self):
+        dd = self._load_dashboard()
+        self.assertEqual("Instagram", dd.pkg_name("com.instagram.android"))
+        self.assertEqual("Whatsapp", dd.pkg_name("com.whatsapp"))
+        self.assertEqual("Messaging", dd.pkg_name("com.google.android.apps.messaging"))
+        self.assertEqual("(system)", dd.pkg_name(""))
+
     def test_sync_without_a_tty_exits_cleanly(self):
         run_dashboard(self.home, "--configure",
                       "--server", "http://127.0.0.1:1",

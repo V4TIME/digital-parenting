@@ -468,13 +468,21 @@ def alert_reason(r):
     return safe_text(labels.get(r, r))
 
 
+# Trailing segments that describe the platform rather than the app.
+_GENERIC_PKG_SUFFIXES = {"android", "app", "apps", "client", "mobile", "beta", "debug"}
+
+
 def pkg_name(pkg):
     pkg = safe_text(pkg)
     if not pkg:
         return "(system)"
-    short = pkg.split(".")
-    if len(short) >= 2:
-        return safe_text(short[-1].capitalize())
+    parts = [p for p in pkg.split(".") if p]
+    # com.instagram.android used to render as "Android"; strip platform
+    # segments so the parent sees the app, not the OS.
+    while len(parts) > 1 and parts[-1].lower() in _GENERIC_PKG_SUFFIXES:
+        parts.pop()
+    if len(parts) >= 2:
+        return safe_text(parts[-1].capitalize())
     return pkg
 
 
@@ -549,13 +557,18 @@ def compute_screen_durations(rows, max_gap_ms=MAX_SESSION_GAP_MS):
     """Return (event_count, attributed_ms) per package.
 
     `data` is the class name for screen_active, not a duration, so duration is
-    inferred from the gap between consecutive events of the same package. The
-    old code clamped that gap to one day, which turned an overnight idle gap
-    into up to 24 h of screen time for whichever app was opened next.
+    inferred from the gap between consecutive events. The old code clamped that
+    gap to one day, which turned an overnight idle gap into up to 24 h of
+    screen time for whichever app was opened next.
+
+    Gaps are attributed globally, not per package. Tracking `last_active` per
+    package credited the time another app spent in the foreground back to the
+    app before it: A at 0, B at 100 s, B at 200 s, A at 300 s reported 300 s
+    for A *plus* 100 s for B — 400 s inside a 300 s window. Walking the merged
+    timeline attributes each gap to the app that was on screen when it started.
     """
     total = {}
     duration = {}
-    last_active = {}
     # Sync stores the server's newest-first response, so rows are not
     # necessarily chronological. Sorting here keeps the helper correct even
     # when a caller forgets ORDER BY (Timsort is linear on sorted input).
@@ -572,12 +585,13 @@ def compute_screen_durations(rows, max_gap_ms=MAX_SESSION_GAP_MS):
             clean.append((str(pkg or ""), int(float(ts))))
         except (TypeError, ValueError):
             continue
-    for pkg, ts in sorted(clean, key=lambda r: r[1]):
+    ordered = sorted(clean, key=lambda r: r[1])
+    for i, (pkg, ts) in enumerate(ordered):
         total[pkg] = total.get(pkg, 0) + 1
-        prev = last_active.get(pkg)
-        if prev is not None and ts > prev:
-            duration[pkg] = duration.get(pkg, 0) + min(ts - prev, max_gap_ms)
-        last_active[pkg] = ts
+        if i + 1 < len(ordered):
+            nxt = ordered[i + 1][1]
+            if nxt > ts:
+                duration[pkg] = duration.get(pkg, 0) + min(nxt - ts, max_gap_ms)
     return total, duration
 
 
