@@ -7,7 +7,7 @@
   <br><br>
   <img src="docs/badges/android.svg" alt="Android: target SDK 35" height="28">
   <img src="docs/badges/tests.svg" alt="65 tests passing" height="28">
-  <img src="docs/badges/rust.svg" alt="Rust collector, 656 kB" height="28">
+  <img src="docs/badges/rust.svg" alt="Rust collector, 681 kB" height="28">
   <img src="docs/badges/network.svg" alt="Tailnet only" height="28">
   <!-- Local SVG assets only: no external badge services. Keep tests.svg in sync. -->
   <br><br>
@@ -26,7 +26,7 @@
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
 > dashboard. The full suite is **65 tests, 0 failures, 0 skipped** against a
-> live collector, plus 35 collector tests and 21 dashboard regression tests.
+> live collector, plus 37 collector tests and 21 dashboard regression tests.
 > Remaining work is a run on a physical phone; no Android device or KVM is
 > available in the build environment.
 
@@ -36,7 +36,7 @@
 |---|---|
 | **Private by construction** | No account, no cloud, no telemetry. The app speaks HTTP to a collector you run, over a Tailscale/WireGuard tailnet. The collector writes `state.json` owner-only (`0600`) and never echoes the parent token. |
 | **Honest about trade-offs** | [`AUDIT.md`](AUDIT.md) is a real audit: it found a reverse-shell prototype, token leaks, a collector crash, and a disk-bound write path. It also states the measured result that **Node serves more writes per second than this Rust server** — Rust is kept for memory and footprint, not hype. |
-| **Built for a phone** | 656 kB collector binary, 744 kB idle RSS, 250-event upload batches with retry-first queues, and bounded view traversal so a huge chat or browser tree cannot turn the accessibility callback into an ANR. |
+| **Built for a phone** | 681 kB collector binary, 768 kB idle RSS, 250-event upload batches with retry-first queues, and bounded view traversal so a huge chat or browser tree cannot turn the accessibility callback into an ANR. |
 | **A dashboard, not a web page** | `termux/dashboard.py` is pure Python standard library and prints to the terminal. One command checks health + token before you trust a blank screen. |
 
 ## Features
@@ -87,7 +87,7 @@ cd server
 CHILDGUARD_TOKEN='use-a-long-random-secret' node index.js
 ```
 
-The Rust build is the deployment target: same behaviour, 656 kB binary,
+The Rust build is the deployment target: same behaviour, 681 kB binary,
 constant-time auth, poison-safe locking, coalesced persistence.
 
 ### 2 · Android app
@@ -183,7 +183,7 @@ method are in [`AUDIT.md`](AUDIT.md) and [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 
 | Layer | Command | Last result |
 |---|---|---|
-| Collector unit tests | `cargo test --offline` | **35 passed, 0 failed** |
+| Collector unit tests | `cargo test --offline` | **37 passed, 0 failed** |
 | Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **21 passed, 0 failed** |
 | Collector lints | `cargo clippy --offline -- -D warnings` | **exit 0** |
 | Legacy collector | `node server/smoke_test.js` | **SMOKE OK** |

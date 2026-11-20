@@ -344,6 +344,7 @@ fn write_html_response(
         404 => "Not Found",
         408 => "Request Timeout",
         413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
@@ -503,11 +504,17 @@ fn read_request_with_budget(stream: &mut TcpStream, budget: Duration) -> Result<
         if find_subsequence(&buf[scan_from..], b"\r\n\r\n").is_some() {
             break;
         }
+        // No terminator yet and the header region is already over budget: a
+        // header flood must not be buffered all the way to the body cap.
+        // RFC 6585: 431 Request Header Fields Too Large, not 413.
+        if buf.len() > MAX_HEADER_REGION {
+            return Err(431);
+        }
     }
 
     let split = find_subsequence(&buf, b"\r\n\r\n").ok_or(400u16)?;
     if split > MAX_HEADER_REGION {
-        return Err(413);
+        return Err(431);
     }
     let head_bytes = &buf[..split];
     let mut body = buf[split + 4..].to_vec();
@@ -1072,6 +1079,7 @@ fn main() {
                     let msg = match status {
                         408 => "request timeout",
                         413 => "payload too large",
+                        431 => "request header fields too large",
                         _ => "bad request",
                     };
                     json_response(&mut conn, status, &serde_json::json!({ "error": msg }));
@@ -1118,6 +1126,7 @@ fn main() {
                         404 => "not found",
                         408 => "request timeout",
                         413 => "payload too large",
+                        431 => "request header fields too large",
                         _ => "bad request",
                     };
                     json_response(&mut conn, status, &serde_json::json!({ "error": msg }));
@@ -1709,6 +1718,45 @@ mod tests {
         // silently treat it as an empty body.
         let payload = b"POST /api/register HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
         assert_eq!(Some(400), read_once(payload).err());
+    }
+
+    #[test]
+    fn an_oversized_header_block_is_431_not_413() {
+        // 413 means the BODY is too large. A 64 KiB header block is a
+        // different failure (RFC 6585 431) and used to be reported as 413,
+        // which sends the client looking at its payload.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"GET /health HTTP/1.1\r\nHost: x\r\nX-Big: ");
+        payload.extend(std::iter::repeat(b'a').take(MAX_HEADER_REGION));
+        payload.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(
+            Some(431),
+            read_once(Box::leak(payload.into_boxed_slice())).err()
+        );
+    }
+
+    #[test]
+    fn an_unterminated_header_flood_is_431_without_buffering_the_body_cap() {
+        // No CRLFCRLF: the old loop kept reading until MAX_BODY + 64 KiB
+        // (2.1 MiB) before answering. A 256 KiB flood must be refused at the
+        // 64 KiB header budget.
+        let (result, elapsed) = with_stalled_client(
+            |s| {
+                let _ = s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nX-Flood: ");
+                let junk = vec![b'a'; 4096];
+                for _ in 0..64 {
+                    if s.write_all(&junk).is_err() {
+                        break;
+                    }
+                }
+            },
+            Duration::from_secs(10),
+        );
+        assert_eq!(Some(431), result.err(), "a header flood is not a timeout");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "header flood was buffered too long: {elapsed:?}"
+        );
     }
 
     #[test]

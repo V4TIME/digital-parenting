@@ -99,6 +99,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-70 | medium | Android | The upload loop was a single self-posting `Runnable` that re-armed via the `uploadHandler` **field**. `stopUploadLoop()` used `quitSafely()`, so a pass already running finished after `stop` and then posted itself onto the *new* loop's handler. Every STOP→START added another permanent chain: two, three, … full batches hitting the collector every 15 s, with duplicate uploads and extra radio wake-ups. | single `uploadRunnable` + `uploadHandler?.postDelayed(this, delay)` | **Fixed 2026-11-20** — each loop captures its own `Handler` and a `@Volatile` generation; a pass from a dead generation returns without rescheduling. `restartingTheLoopDoesNotDoubleTheUploadRate` fails on the old shape (`expected:<1> but was:<2>`) and passes on the fix |
 | F-71 | low | Dashboard | Sync copied the server's timestamp by type only: `int(float(raw))`. Both collectors treat `0`/negative/missing as "now" and clamp clock skew to +1 h, but the dashboard stored `0` as **1970** (sorted below every real event and ruining screen-time windows) and a JSON `1e400` (Python `inf`) raised `OverflowError`, which the per-row `except` swallowed — the event vanished. | `try: int(float(raw)) except (TypeError, ValueError): now` | **Fixed 2026-11-20** — the same policy as Rust/Node: non-finite or `<= 0` ⇒ `now`, future values clamped to `now + 1 h`; `test_sync_sanitizes_zero_negative_and_future_timestamps` (old code stores 3 of 4 rows) |
 | F-72 | low | Dashboard | Export names used `time.strftime("%Y%m%d-%H%M%S")` and `O_TRUNC`. Two exports in the same second — a retry, a double invocation, or two shells — silently overwrote the first bundle, and the staging `.jsonl` names could collide between concurrent runs. | second-resolution name + `O_TRUNC`, fixed `events_{stamp}.jsonl` names | **Fixed 2026-11-20** — the bundle is claimed atomically with `O_EXCL` (`name.tar.gz`, `name-2.tar.gz`, …) and staging files use `tempfile.mkstemp`; a failed export removes the partial bundle and closes its fd. `test_two_exports_in_the_same_second_do_not_overwrite` (old code leaves 1 bundle) |
+| F-73 | low | Rust collector | An oversized header region was answered with **413 Payload Too Large**, and the read loop did not enforce the 64 KiB header budget while waiting for `\r\n\r\n`: it buffered up to `MAX_BODY + 64 KiB` (~2.1 MiB) and, with a client that keeps writing, held the connection until the 30 s deadline. Node's HTTP parser answers 431 at its 16 KiB limit, so the collectors also disagreed. | `split > MAX_HEADER_REGION ⇒ 413`, no early cap | **Fixed 2026-11-20** — the loop returns `431` as soon as the unterminated header region exceeds 64 KiB, and a terminated oversized block is `431`; the reason phrase and log text were added. Tests `an_oversized_header_block_is_431_not_413` and `an_unterminated_header_flood_is_431_without_buffering_the_body_cap` (old code: 413 and a 10 s 408). Live: 70 KiB headers → `431` in 1.9 ms / 1.6 ms; valid request → `200` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -139,8 +140,8 @@ across the 16-client and 1-client write runs, not on a single decimal.
 
 | Metric | Rust | Node 24 |
 |---|---:|---:|
-| Idle RSS | **744 kB** (VmSize 4.3 MB, 1 thread) | 45.3 MB |
-| On-disk | **656 kB** binary | 62 MB (`node` + `libnode.so.137`) |
+| Idle RSS | **768 kB** (VmSize 4.3 MB, 1 thread) | 45.3 MB |
+| On-disk | **681 kB** binary | 62 MB (`node` + `libnode.so.137`) |
 | Cold start to first `/health` (median of 5) | 152 ms | **127 ms** |
 
 ### What this means
@@ -152,8 +153,8 @@ across the 16-client and 1-client write runs, not on a single decimal.
 2. **Scale makes it moot.** One child produces on the order of one event per
    second. 229 req/s vs 329 req/s is a 200× headroom argument, not a user-visible
    one.
-3. **Rust wins where this deployment actually hurts: memory and size.** 744 kB
-   idle vs 45 MB, 656 kB vs 62 MB installed. On a phone/Termux box that is the
+3. **Rust wins where this deployment actually hurts: memory and size.** 768 kB
+   idle vs 45 MB, 681 kB vs 62 MB installed. On a phone/Termux box that is the
    difference between a background service that coexists with other apps and one
    that gets killed.
 4. **Rust also wins the read path** (496 vs 424 req/s, better p99), which is what
@@ -179,7 +180,7 @@ across the 16-client and 1-client write runs, not on a single decimal.
 ### Rust collector — keep it, for the right reason
 
 - It is already Rust, so "switch to Rust" is already done for the backend.
-- Keep it for memory footprint (744 kB vs 45 MB), deployment size (656 kB vs
+- Keep it for memory footprint (768 kB vs 45 MB), deployment size (681 kB vs
   62 MB), no GC pauses, and the read-path win — **not** for write throughput,
   where Node is ahead. If write throughput ever matters, the fix is the
   concurrency model (sharding/reducing lock hold time), not a language change.
@@ -933,10 +934,48 @@ Ran 2 tests ... FAILED (failures=2)
 
 After the fix: `Ran 21 tests ... OK`.
 
+## 5t. Daily audit — 2026-11-20, header-budget pass
+
+One more Rust-vs-Node divergence, this time in framing rather than data.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Header overflow | `413` (body too large) | `431` (header fields too large) | unit + live |
+| Enforcement | No cap until the body limit; 2.1 MiB buffer, 30 s wait | Reject at 64 KiB while reading | flood test: 10 s → instant |
+
+Why these shapes:
+
+- **The status code is the contract.** `413` tells the client to shrink its
+  body. The body was fine; the headers were not. Node already answers `431`
+  (its parser has a 16 KiB limit), so matching it means a script sees the same
+  answer from either collector.
+- **A cap that is only checked after the terminator is not a cap.** A client
+  that never sends `\r\n\r\n` made the loop read up to the body budget.
+  That is 2.1 MiB of per-connection buffer and a 30 s hold — exactly what a
+  slowloris wants. Checking the *unterminated* length every read bounds both.
+- **Valid requests are untouched.** The check runs only after the scan fails
+  to find the terminator, so a 64 KiB header block followed by a body in the
+  same read is still accepted based on `split`, not total buffer size.
+
+Proof, same binary, three socket probes:
+
+```
+terminated 70 KiB        HTTP/1.1 431 Request Header Fields Too Large  (1.9 ms)
+unterminated 70 KiB      HTTP/1.1 431 Request Header Fields Too Large  (1.6 ms)
+valid health             HTTP/1.1 200 OK
+```
+
+Old shape, new tests (checks reverted only):
+
+```
+an_oversized_header_block_is_431_not_413            FAILED  left: 431  right: 413
+an_unterminated_header_flood_is_431_without_...     FAILED  left: 431  right: 408  (10.24 s)
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 35 passed; 0 failed
+server-rust:  cargo test            → 37 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,
@@ -988,7 +1027,7 @@ trade-offs, and each names the condition that would justify switching.
 | Accessibility capture | Read only the focused node instead of a budgeted full-window dump | WebViews, custom chat lists, and IMEs often expose text only in siblings or the root tree. The dump is bounded by depth, node count, character count, an 800 ms gate, and a content hash, so cost is predictable. | If profiling on a low-end phone shows the dump dominates CPU. Target the focused subtree first. |
 | Screen time | Android `UsageStatsManager` | It needs the separate `PACKAGE_USAGE_STATS` special permission and gives OS-level totals, but the event-gap method needs no extra consent and is already available. The 5-minute session cap bounds the approximation error. | If minute-accurate totals matter more than the extra permission. |
 | Two collectors | Delete the Node collector and keep Rust only | Existing Node users and the legacy API are still exercised by `server/smoke_test.js`; the cost is duplicate maintenance, which is why both are brought to the same security behavior and tested. | If the Node path has no users; then remove it and its docs. |
-| Rust vs Node | Node measured **329 writes/s** vs Rust 227 on this host | Rust is kept for a 656 kB binary and 744 kB idle RSS on a phone, not for throughput. The audit states this plainly rather than claiming Rust is faster. | If throughput on a large host matters more than footprint, Node is the faster choice. |
+| Rust vs Node | Node measured **329 writes/s** vs Rust 227 on this host | Rust is kept for a 681 kB binary and 768 kB idle RSS on a phone, not for throughput. The audit states this plainly rather than claiming Rust is faster. | If throughput on a large host matters more than footprint, Node is the faster choice. |
 
 The rule behind these choices: **bound the work, then keep the simplest design
 that stays inside the bound.** A full snapshot, a full window, and a full tree
