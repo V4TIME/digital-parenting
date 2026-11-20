@@ -10,6 +10,9 @@ class ChildGuardApp : Application() {
         const val KEY_SERVER_URL = "server_url"
         const val KEY_CHILD_NAME = "child_name"
         const val KEY_PARENT_TOKEN = "parent_token"
+        /** Id generated before the first registration attempt, so a lost
+         * response is retried with the same id instead of minting a new child. */
+        const val KEY_PENDING_CHILD_ID = "pending_child_id"
         const val KEY_MONITORING = "monitoring_enabled"
         const val KEY_KEYLOGGER = "keylogger_enabled"
         const val KEY_NOTIFICATIONS = "notifications_enabled"

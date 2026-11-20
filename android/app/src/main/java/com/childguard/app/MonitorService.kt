@@ -83,6 +83,29 @@ class MonitorService : Service() {
             return withScheme.trimEnd('/')
         }
 
+        /** A stable id generated before the first registration attempt.
+         *
+         * The server echoes it back, so a retry after a lost response updates
+         * the same child instead of creating a duplicate. */
+        internal fun newChildId(): String =
+            "cg_" + java.util.UUID.randomUUID().toString().replace("-", "").take(20)
+
+        /** Read at most `limit` bytes of a response body.
+         *
+         * A proxy or misconfigured server can answer 200 with an arbitrarily
+         * large page; the previous readText() buffered all of it into the
+         * app's heap. The register payload is tiny, so a few KiB is plenty. */
+        internal fun readAtMost(input: java.io.InputStream, limit: Int): String {
+            val out = java.io.ByteArrayOutputStream(minOf(limit, 8192))
+            val chunk = ByteArray(4096)
+            while (out.size() < limit) {
+                val n = input.read(chunk, 0, minOf(chunk.size, limit - out.size()))
+                if (n < 0) break
+                out.write(chunk, 0, n)
+            }
+            return String(out.toByteArray(), Charsets.UTF_8)
+        }
+
         var isMonitoring = false
             private set
         var isKeylogging = false
@@ -415,32 +438,52 @@ class MonitorService : Service() {
         val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
         val name = sp.getString(ChildGuardApp.KEY_CHILD_NAME, "Child") ?: "Child"
 
-        val body = JSONObject().put("name", name)
+        // Persist the id before the POST. If the response is lost, the retry
+        // sends the same id and the server updates that child instead of
+        // minting another one on every attempt.
+        val pending = sp.getString(ChildGuardApp.KEY_PENDING_CHILD_ID, "").orEmpty()
+        val requestedId = pending.ifEmpty { newChildId() }
+        if (pending.isEmpty()) {
+            sp.edit().putString(ChildGuardApp.KEY_PENDING_CHILD_ID, requestedId).apply()
+        }
+
+        val body = JSONObject().put("name", name).put("childId", requestedId)
+        var conn: HttpURLConnection? = null
         try {
-            val conn = URL("$serverUrl/api/register").openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 10_000
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
+            val opened = URL("$serverUrl/api/register").openConnection() as HttpURLConnection
+            conn = opened
+            opened.requestMethod = "POST"
+            opened.connectTimeout = 10_000
+            opened.readTimeout = 10_000
+            opened.doOutput = true
+            opened.setRequestProperty("Content-Type", "application/json")
             if (token.isNotEmpty()) {
-                conn.setRequestProperty("Authorization", "Bearer $token")
+                opened.setRequestProperty("Authorization", "Bearer $token")
             }
-            (conn.outputStream as OutputStream).write(body.toString().toByteArray(Charsets.UTF_8))
-            val code = conn.responseCode
-            if (code == 200) {
-                val text = conn.inputStream.bufferedReader().readText()
-                conn.disconnect()
-                val childId = JSONObject(text).optString("childId")
-                if (childId.isNotEmpty()) {
-                    sp.edit().putString("child_id", childId).apply()
-                    return childId
-                }
-            } else {
-                conn.disconnect()
+            (opened.outputStream as OutputStream).write(body.toString().toByteArray(Charsets.UTF_8))
+            val code = opened.responseCode
+            if (code != 200) {
+                // The parent sees "Monitoring: ON" with no uploads; at least
+                // adb logcat and bug reports now name the reason.
+                Log.w(TAG, "registration rejected with $code; events stay queued")
+                return null
             }
+            val text = readAtMost(opened.inputStream, 8 * 1024)
+            val childId = runCatching { JSONObject(text).optString("childId") }
+                .getOrDefault("")
+            if (childId.isEmpty()) {
+                Log.w(TAG, "registration returned no childId; will retry")
+                return null
+            }
+            sp.edit()
+                .putString("child_id", childId)
+                .remove(ChildGuardApp.KEY_PENDING_CHILD_ID)
+                .apply()
+            return childId
         } catch (e: Exception) {
             Log.w(TAG, "registration error: ${e.message}")
+        } finally {
+            conn?.disconnect()
         }
         return null
     }

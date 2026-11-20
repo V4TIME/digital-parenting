@@ -3,6 +3,7 @@ package com.childguard.app
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -103,6 +104,28 @@ class UploadBatchingTest {
         assertNull(MonitorService.normalizeHttpUrl("   "))
         assertNull(MonitorService.normalizeHttpUrl("ftp://cg.example"))
         assertNull(MonitorService.normalizeHttpUrl("http://"))
+    }
+
+    @Test
+    fun registrationIdIsStablePerAttemptAndBounded() {
+        val a = MonitorService.newChildId()
+        val b = MonitorService.newChildId()
+        assertTrue("ids must be prefixed", a.startsWith("cg_"))
+        assertTrue("ids must fit the server cap", a.length <= 128)
+        assertNotEquals("each fresh install gets its own id", a, b)
+    }
+
+    @Test
+    fun registrationResponseReadIsBounded() {
+        val big = ByteArray(200_000) { 'a'.code.toByte() }
+        val text = MonitorService.readAtMost(java.io.ByteArrayInputStream(big), 8 * 1024)
+        assertEquals("read must stop at the cap", 8 * 1024, text.length)
+
+        val small = "{\"childId\":\"cg_x\"}".toByteArray()
+        assertEquals(
+            "{\"childId\":\"cg_x\"}",
+            MonitorService.readAtMost(java.io.ByteArrayInputStream(small), 8 * 1024)
+        )
     }
 
     @Test

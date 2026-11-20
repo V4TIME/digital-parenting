@@ -655,7 +655,17 @@ fn handle_register(state: &Arc<Mutex<AppState>>, body: &[u8]) -> Result<(u16, se
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Child".to_string());
     let name = clip(&name, MAX_CHILD_NAME_BYTES);
-    let id = uid("cg");
+    // A client-supplied id makes registration idempotent. Without it, a lost
+    // response (timeout on a flaky link) made the app retry and the server
+    // mint a fresh id each time, so one device appeared as many children.
+    // Older clients omit the field and keep the generated-id behaviour.
+    let id = parsed
+        .get("childId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| clip(s, MAX_ID_BYTES))
+        .unwrap_or_else(|| uid("cg"));
     let now = now_ms();
     let mut st = lock_state(state);
     bump_child(
@@ -1306,6 +1316,32 @@ mod tests {
         let (_code, val) = handle_register(&state, b"{\"name\":\"Kid\"}").unwrap();
         assert!(val["childId"].as_str().unwrap().starts_with("cg_"));
         assert!(val.get("token").is_none(), "register must not echo the token");
+    }
+
+    #[test]
+    fn registering_with_a_client_supplied_id_is_idempotent() {
+        // A lost register response made the app retry; the server used to
+        // mint a new id each time, so one device appeared as many children.
+        let state = test_state("secret");
+        let body = r#"{"childId":"cg_device_1","name":"Ann"}"#;
+        let (code, val) = handle_register(&state, body.as_bytes()).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(val["childId"].as_str(), Some("cg_device_1"));
+        let (_, val2) = handle_register(&state, body.as_bytes()).unwrap();
+        assert_eq!(val2["childId"].as_str(), Some("cg_device_1"));
+        let st = state.lock().unwrap();
+        assert_eq!(st.children.len(), 1, "retry created a second child");
+        assert_eq!(st.children["cg_device_1"].name, "Ann");
+    }
+
+    #[test]
+    fn supplied_child_id_is_clipped_like_an_event_id() {
+        let state = test_state("secret");
+        let body = format!(r#"{{"childId":"{}"}}"#, "c".repeat(10_000));
+        let (code, val) = handle_register(&state, body.as_bytes()).unwrap();
+        assert_eq!(code, 200);
+        let id = val["childId"].as_str().unwrap();
+        assert_eq!(id.len(), MAX_ID_BYTES);
     }
 
     #[test]

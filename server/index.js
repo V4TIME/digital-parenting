@@ -244,7 +244,10 @@ const server = http.createServer((req, res) => {
         return;
       }
       const name = (typeof d.name === 'string' && d.name.trim()) ? d.name.trim().slice(0, 128) : 'Child';
-      const child = bumpChild(uid(), name);
+      // A client-supplied id makes registration idempotent: a lost response
+      // must not mint a second child on retry. Older clients omit it.
+      const supplied = typeof d.childId === 'string' ? clip(d.childId.trim(), MAX_ID_BYTES) : '';
+      const child = bumpChild(supplied || uid(), name);
       // Never echo the parent token; the client already has it.
       sendJson(res, 200, { childId: child.id });
     });

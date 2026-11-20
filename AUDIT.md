@@ -93,6 +93,8 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-64 | medium | Dashboard | Screen time was credited per package from that package's previous event. With WhatsApp 0–100 s and Instagram 100–300 s, WhatsApp got the entire 300 s span **and** Instagram got its 100 s: 400 s of screen time inside a 300 s window, shown to the parent as fact. | `last_active[pkg]`, then `min(ts - prev, max_gap)` per package | **Fixed 2026-11-19** — walk the merged timeline once and attribute each gap to the app that was on screen when it started; `test_foreground_switch_credits_only_the_app_on_screen`; pre-fix probe returned WhatsApp 300,000 ms + Instagram 100,000 ms inside a 300,000 ms window; live `--screen-time` now shows Instagram 3m, WhatsApp 1m |
 | F-65 | low | Dashboard | `pkg_name` used the last package segment, so `com.instagram.android` displayed as **Android** and `com.google.android.apps.messaging` as **Messaging** only by luck. | `pkg.split(".")[-1].capitalize()` | **Fixed 2026-11-19** — platform suffixes (`android`, `app`, `apps`, `client`, `mobile`, `beta`, `debug`) are stripped before labeling; `test_package_labels_skip_platform_segments` |
 | F-66 | low | Node collector | `limit` disagreed with the Rust collector. `parseInt` accepted `5.9` as 5 and `12abc` as 12, and `limit=0` returned the **default 200** instead of none, because the default check treated 0 as "unset". Rust returns 0 events for `limit=0` and falls back for non-numeric values, so the same request returned different data depending on which collector was running. | `parseInt(raw, 10)` + `n <= 0 ⇒ fallback` | **Fixed 2026-11-20** — only ASCII digits are accepted, `Number.isSafeInteger` rejects overflow, and `tail()` handles 0 explicitly because `slice(-0)` returns the whole list; smoke test covers `0`, `5.9` and `1`; live side-by-side (Rust 38080 / Node 38081) now identical for `0, 2, 5.9, abc, -1` |
+| F-67 | medium | All | Registration had no client identity: `/api/register` always minted a fresh `cg_…` id. If the reply was lost (10 s timeout, app killed, flaky tailnet), `ensureRegistered` retried and the collector created **another child**. One phone then appears as N children in `--doctor`/`stats`; at the 2,000 cap the LRU starts evicting real children, and every phantom id inflates `state.json`. | Rust `let id = uid("cg")`, Node `bumpChild(uid(), name)`, Android POSTed only `{name}` | **Fixed 2026-11-20** — the app generates and persists a `pending_child_id` **before** the POST and sends it; both collectors accept a supplied `childId` (clipped to 128 B) and treat a re-register as a touch. Older clients that omit it still get a generated id. Tests: `registering_with_a_client_supplied_id_is_idempotent`, `supplied_child_id_is_clipped_like_an_event_id`, Node smoke 7e. Live same-binary probe: two id-less registers → 2 children; two with `cg_phone_1` → 1 child |
+| F-68 | low | Android | Registration read its reply with `bufferedReader().readText()`, with no size limit. A proxy or broken server answering 200 with a large page buffered it all into the app heap. | unbounded `readText()` | **Fixed 2026-11-20** — `readAtMost(input, 8 KiB)`; a malformed 200 now keeps the pending id and retries instead of being trusted; non-200 outcomes are logged with the status; `registrationResponseReadIsBounded` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -794,23 +796,60 @@ limit=abc  rust 3 events   node 3 events   (fallback)
 limit=-1   rust 3 events   node 3 events   (fallback)
 ```
 
+## 5q. Daily audit — 2026-11-20, idempotent registration pass
+
+Feature 1's first step is `/api/register`. It had no notion of *which device*
+was asking, so retrying it was destructive.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Duplicate children | Lost reply → retry → new `cg_…` id every time | App supplies a persisted stable id; servers honour it | same-binary probe 2 → 1 |
+| Response read | Unbounded `readText()` | `readAtMost(…, 8 KiB)` | `registrationResponseReadIsBounded` |
+| Visibility | Non-200 was silent | `Log.w` with the status; malformed 200 retried | code + test |
+
+Why these shapes:
+
+- **Generate the id before the request, not after the reply.** Persisting
+  `pending_child_id` first means the retry carries the same identity even if
+  the first POST reached the server and only its response was lost. Clearing
+  it only on success keeps the window closed.
+- **The server stays backward compatible.** `childId` is optional; a client
+  that omits it (older APK, hand-written curl) still gets a generated id, so
+  the change cannot break an existing install.
+- **A malformed 200 is not success.** Trusting any 200 would store a
+  meaningless id and send every later event to it; retrying is bounded by the
+  same backoff as an unreachable server.
+
+Live probe against one Rust binary (port 38082), same body twice:
+
+```
+old client shape (no childId):
+  cg_0d1bf189… / cg_f3d51e81…   -> 2 children named "Kid"
+
+new client shape (childId=cg_phone_1):
+  cg_phone_1 / cg_phone_1       -> 1 child
+```
+
+Android keeps the id across a lost response: the pref is written before the
+POST and removed only after a 200 that contains a `childId`.
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 33 passed; 0 failed
+server-rust:  cargo test            → 35 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,
               LRU eviction, field clipping, stream limit, liveness)
-android:      56 tests, 0 failures, 0 skipped (with live server)
+android:      58 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
-              Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 6,
+              Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 8,
               DashboardActivity 2, MonitorServiceLifecycle 4,
               SetupActivity 2, WebMonitorActivity 1
 dashboard:    python3 -m unittest termux/test_dashboard.py → 19 passed
 android:      assembleDebug → app-debug.apk 7,400,089 bytes,
-              sha256 d2f6679f...bf1f8d
+              sha256 93eddba1...bb470
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";

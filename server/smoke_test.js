@@ -187,6 +187,17 @@ function openStream() {
   assert.strictEqual(JSON.parse(retry.body).received, 0,
     'clipped retry was counted twice');
 
+  // 7e. Registration is idempotent when the client supplies an id, so a lost
+  //     response (the app retries) does not create a second child.
+  const stableName = { childId: 'cg_stable_device', name: 'Stable' };
+  const stable1 = await request('POST', '/api/register', stableName);
+  const stable2 = await request('POST', '/api/register', stableName);
+  assert.strictEqual(JSON.parse(stable1.body).childId, 'cg_stable_device');
+  assert.strictEqual(JSON.parse(stable2.body).childId, 'cg_stable_device');
+  const stableKids = JSON.parse((await request('GET', '/api/stats')).body)
+    .children.filter(c => c.id === 'cg_stable_device');
+  assert.strictEqual(stableKids.length, 1, 'retry created a duplicate child');
+
   // 8. A user-supplied token must never be printed at startup.
   assert.ok(!serverOutput.includes(TOKEN), 'startup log leaked the user-supplied token');
 
