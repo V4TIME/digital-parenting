@@ -1,6 +1,7 @@
 package com.childguard.app
 
 import android.app.Notification
+import android.content.Context
 import android.os.Process
 import android.service.notification.StatusBarNotification
 import androidx.core.app.NotificationCompat
@@ -8,6 +9,7 @@ import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -15,6 +17,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
@@ -181,6 +184,35 @@ class Feature3NotificationTest {
         // The newest message survived the eviction.
         assertTrue(
             ChildGuardNotificationListener.queue.any { it.optString("text") == "message 260" }
+        )
+    }
+
+    @Test
+    fun notificationQueueOverflowIsCountedNotSilent() {
+        // The second bounded queue has the same failure mode as Feature 1's:
+        // a burst of chat notifications evicts older ones with no trace.
+        val prefs = RuntimeEnvironment.getApplication()
+            .getSharedPreferences(ChildGuardApp.PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .remove(MonitorService.KEY_DROPPED_EVENTS)
+            .remove(MonitorService.KEY_LAST_REJECTION)
+            .apply()
+
+        for (i in 1..260) {
+            listener.onNotificationPosted(sbn("com.whatsapp", "Mom", "burst $i"))
+        }
+
+        assertEquals(200, ChildGuardNotificationListener.queue.size)
+        assertEquals(
+            "all 60 evictions must be counted",
+            60,
+            prefs.getInt(MonitorService.KEY_DROPPED_EVENTS, 0)
+        )
+        val warning = MonitorService.droppedWarning(prefs)
+        assertNotNull("local loss must be visible", warning)
+        assertTrue(
+            "the warning must blame the queue: $warning",
+            warning!!.contains("lost locally")
         )
     }
 

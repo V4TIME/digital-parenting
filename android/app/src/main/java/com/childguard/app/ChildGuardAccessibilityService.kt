@@ -412,8 +412,12 @@ class ChildGuardAccessibilityService : AccessibilityService() {
             put("data", data)
             put("ts", System.currentTimeMillis())
         }
-        while (eventQueue.size >= MAX_QUEUE) eventQueue.poll()
+        var lost = 0
+        while (eventQueue.size >= MAX_QUEUE) {
+            if (eventQueue.poll() != null) lost += 1
+        }
         eventQueue.add(obj)
+        MonitorService.recordLocalLoss(this, lost)
     }
 
     override fun onInterrupt() {

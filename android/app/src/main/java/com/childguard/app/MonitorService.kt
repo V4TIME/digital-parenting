@@ -62,14 +62,36 @@ class MonitorService : Service() {
             return total
         }
 
-        /** Parent-facing warning, or null when nothing has been lost. */
+        /** Count events evicted from a full local capture queue.
+         *
+         * The queue caps are the only thing standing between a chatty screen
+         * and unbounded memory, but evicting the oldest event is still lost
+         * evidence. It goes through the same durable counter as a server
+         * rejection so the dashboard can say so.
+         */
+        internal fun recordLocalLoss(context: Context, count: Int) {
+            if (count <= 0) return
+            val sp = context.getSharedPreferences(ChildGuardApp.PREFS, Context.MODE_PRIVATE)
+            val total = noteDroppedEvents(sp, count, 0)
+            Log.w(TAG, "capture queue full; dropped $count event(s), total=$total")
+        }
+
+        /** Parent-facing warning, or null when nothing has been lost.
+         *
+         * `code > 0` is a server rejection; `0` is a local queue overflow.
+         * The count is cumulative, so the sentence names the most recent
+         * cause rather than pretending to split the history.
+         */
         internal fun droppedWarning(sp: SharedPreferences): String? {
             val total = sp.getInt(KEY_DROPPED_EVENTS, 0)
             if (total <= 0) return null
             val code = sp.getInt(KEY_LAST_REJECTION, 0)
-            val http = if (code > 0) " (HTTP $code)" else ""
             val what = if (total == 1) "1 event was" else "$total events were"
-            return "$what rejected by the server$http. Check the server URL and token in Setup."
+            return if (code > 0) {
+                "$what rejected by the server (HTTP $code). Check the server URL and token in Setup."
+            } else {
+                "$what lost locally: the capture queue was full. Check the server connection."
+            }
         }
 
         internal const val KEY_UPLOAD_ERROR = "last_upload_error"

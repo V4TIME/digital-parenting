@@ -150,8 +150,12 @@ class ChildGuardNotificationListener : NotificationListenerService() {
             obj.put("type", classify(combined))
         }
 
-        while (queue.size >= MAX_QUEUE) queue.poll()
+        var lost = 0
+        while (queue.size >= MAX_QUEUE) {
+            if (queue.poll() != null) lost += 1
+        }
         queue.add(obj)
+        MonitorService.recordLocalLoss(this, lost)
     }
 
     override fun onListenerConnected() {

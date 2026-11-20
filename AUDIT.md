@@ -101,6 +101,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-72 | low | Dashboard | Export names used `time.strftime("%Y%m%d-%H%M%S")` and `O_TRUNC`. Two exports in the same second — a retry, a double invocation, or two shells — silently overwrote the first bundle, and the staging `.jsonl` names could collide between concurrent runs. | second-resolution name + `O_TRUNC`, fixed `events_{stamp}.jsonl` names | **Fixed 2026-11-20** — the bundle is claimed atomically with `O_EXCL` (`name.tar.gz`, `name-2.tar.gz`, …) and staging files use `tempfile.mkstemp`; a failed export removes the partial bundle and closes its fd. `test_two_exports_in_the_same_second_do_not_overwrite` (old code leaves 1 bundle) |
 | F-73 | low | Rust collector | An oversized header region was answered with **413 Payload Too Large**, and the read loop did not enforce the 64 KiB header budget while waiting for `\r\n\r\n`: it buffered up to `MAX_BODY + 64 KiB` (~2.1 MiB) and, with a client that keeps writing, held the connection until the 30 s deadline. Node's HTTP parser answers 431 at its 16 KiB limit, so the collectors also disagreed. | `split > MAX_HEADER_REGION ⇒ 413`, no early cap | **Fixed 2026-11-20** — the loop returns `431` as soon as the unterminated header region exceeds 64 KiB, and a terminated oversized block is `431`; the reason phrase and log text were added. Tests `an_oversized_header_block_is_431_not_413` and `an_unterminated_header_flood_is_431_without_buffering_the_body_cap` (old code: 413 and a 10 s 408). Live: 70 KiB headers → `431` in 1.9 ms / 1.6 ms; valid request → `200` |
 | F-74 | medium | Android | A wrong token, a dead tailnet, or an unreachable collector left the dashboard at "Monitoring: ON" with **no uploads and no message**. `ensureRegistered`/upload failures only wrote `Log.w`; events were correctly kept for retry, but the parent had no way to distinguish "nothing happened" from "nothing is arriving". | failures logged only; warning state did not exist | **Fixed 2026-11-20** — the current upload problem is persisted (`last_upload_error` + timestamp) and shown as an amber dashboard line ("Uploads failing since 12:04 — server answered HTTP 401. Retrying automatically."); it is cleared by any 2xx or reachable-but-rejected batch, and the same marker covers registration failures. Tests: `currentUploadProblemIsVisibleAndClearsWhenFixed`; the live E2E dead-port test now asserts the warning appears and clears after recovery |
+| F-75 | medium | Android | Both capture queues are capped at 200 events, but the eviction was silent: `while (queue.size >= MAX_QUEUE) queue.poll()` threw the **oldest** captured message away with no counter, no dashboard line, and no notification. A phone that was offline for a few minutes (or a very chatty group chat) lost evidence while the UI still promised capture — the same "silent loss" class as F-69, one layer lower. | `queue.poll()` with no accounting | **Fixed 2026-11-20** — evictions are counted and recorded through the durable loss counter with code `0` (`recordLocalLoss`), so the dashboard says "N events were lost locally: the capture queue was full. Check the server connection."; the counter is written only when something was actually evicted. Tests: `aFullCaptureQueueDropsTheOldestEventLoudly` (old shape: `expected:<1> but was:<0>`), `notificationQueueOverflowIsCountedNotSilent` (`expected:<60> but was:<0>`), `localQueueOverflowIsReportedAsLocalNotAsAServerError` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -1010,6 +1011,46 @@ dead port  -> warning = "Uploads failing since 01:xx — cannot reach the server
 live server-> uploadWarning(prefs) = null
 ```
 
+## 5v. Daily audit — 2026-11-20, local queue loss visibility
+
+F-69 made *server* rejections visible. This pass closes the same hole one layer
+lower: the bounded capture queues.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Accessibility queue | 201st event silently evicted the oldest | Count + durable warning (code 0) | test fails pre-fix (`1` vs `0`) |
+| Notification queue | Same cap, same silence | Same accounting | test fails pre-fix (`60` vs `0`) |
+| Dashboard wording | Only server rejections had text | Local-loss sentence, no "HTTP" | Robolectric UI test |
+
+Why these shapes:
+
+- **The queue cap stays.** 200 is the right bound for a phone; the bug was not
+  the eviction, it was the silence. Counting is a few bytes of prefs only when
+  an eviction happens, so a healthy device pays nothing per event.
+- **One counter, two causes.** `dropped_events_total` already means "captured
+  evidence that will never reach the parent". A local overflow is the same
+  outcome; a second counter would double the UI for no benefit. The sentence
+  names the most recent cause (`code > 0` = server, `0` = local queue), which
+  is what the parent can act on.
+- **The message says what to do.** A full queue usually means uploads have not
+  drained for a while (offline, wrong token, server down). "Check the server
+  connection" points at the cause instead of blaming the child's phone.
+- **No prefs write on the hot path.** `recordLocalLoss` returns immediately
+  for `count <= 0`; an accessibility callback must never touch disk just to
+  confirm nothing was lost.
+
+Proof against the old eviction shape (counting removed, tests kept):
+
+```
+Feature1RuntimeTest > aFullCaptureQueueDropsTheOldestEventLoudly FAILED
+    one evicted event must be counted  expected:<1> but was:<0>
+Feature3NotificationTest > notificationQueueOverflowIsCountedNotSilent FAILED
+    all 60 evictions must be counted  expected:<60> but was:<0>
+```
+
+On the fix: `Feature1RuntimeTest tests=12 failures=0`,
+`Feature3NotificationTest tests=12 failures=0`, `DashboardActivityTest tests=7 failures=0`.
+
 ## 6. Verification log (this audit)
 
 ```
@@ -1018,15 +1059,15 @@ server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,
               LRU eviction, field clipping, stream limit, liveness)
-android:      66 tests, 0 failures, 0 skipped (with live server)
+android:      69 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 8,
-              DashboardActivity 6, MonitorServiceLifecycle 6,
+              DashboardActivity 7, MonitorServiceLifecycle 6,
               SetupActivity 4, WebMonitorActivity 1
 dashboard:    python3 -m unittest termux/test_dashboard.py → 21 passed
 android:      assembleDebug → app-debug.apk 7,400,169 bytes,
-              sha256 5d25b251...c99ca
+              sha256 aa8c214a...f9ad4
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";

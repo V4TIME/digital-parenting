@@ -1,5 +1,6 @@
 package com.childguard.app
 
+import android.content.Context
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONObject
@@ -13,6 +14,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
@@ -190,6 +192,51 @@ class Feature1RuntimeTest {
         service.onAccessibilityEvent(ev)
 
         assertNull("no empty screen_text event", find("screen_text"))
+    }
+
+    @Test
+    fun aFullCaptureQueueDropsTheOldestEventLoudly() {
+        // A phone that is offline for a while fills the 200-event queue. The
+        // 201st event evicts the oldest, and that eviction used to be
+        // completely silent: no counter, no dashboard line, no notification.
+        val prefs = RuntimeEnvironment.getApplication()
+            .getSharedPreferences(ChildGuardApp.PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .remove(MonitorService.KEY_DROPPED_EVENTS)
+            .remove(MonitorService.KEY_LAST_REJECTION)
+            .apply()
+        repeat(200) { i ->
+            ChildGuardAccessibilityService.eventQueue.add(
+                JSONObject()
+                    .put("type", "keylog")
+                    .put("package", "com.whatsapp")
+                    .put("data", "backlog-$i")
+                    .put("ts", 1_000L + i)
+            )
+        }
+
+        service.onAccessibilityEvent(textEvent("com.whatsapp", "queue overflow probe 9911"))
+
+        assertEquals(
+            "the queue must stay at its cap",
+            200,
+            ChildGuardAccessibilityService.eventQueue.size
+        )
+        assertTrue(
+            "the newest event must be the one kept",
+            events().any { it.optString("data") == "queue overflow probe 9911" }
+        )
+        assertEquals(
+            "one evicted event must be counted",
+            1,
+            prefs.getInt(MonitorService.KEY_DROPPED_EVENTS, 0)
+        )
+        val warning = MonitorService.droppedWarning(prefs)
+        assertNotNull("local loss must be shown to the parent", warning)
+        assertTrue(
+            "the warning must blame the local queue: $warning",
+            warning!!.contains("lost locally")
+        )
     }
 
     @Test

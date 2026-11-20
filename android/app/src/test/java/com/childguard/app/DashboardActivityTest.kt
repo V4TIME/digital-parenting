@@ -131,6 +131,27 @@ class DashboardActivityTest {
     }
 
     @Test
+    fun localQueueOverflowIsReportedAsLocalNotAsAServerError() {
+        prefs.edit().putBoolean(ChildGuardApp.KEY_MONITORING, false).apply()
+        MonitorService.noteDroppedEvents(prefs, 2, 0)
+
+        val activity = Robolectric.buildActivity(DashboardActivity::class.java)
+            .create().start().resume().get()
+        val tv = activity.findViewById<android.widget.TextView>(R.id.tv_dropped)
+
+        assertEquals(android.view.View.VISIBLE, tv.visibility)
+        assertTrue("must name the count: ${tv.text}", tv.text.contains("2 events"))
+        assertTrue(
+            "must explain the local cause: ${tv.text}",
+            tv.text.contains("lost locally")
+        )
+        assertFalse(
+            "a full queue is not a server rejection: ${tv.text}",
+            tv.text.contains("rejected by the server")
+        )
+    }
+
+    @Test
     fun droppedCounterAccumulatesAndReadsNaturally() {
         MonitorService.noteDroppedEvents(prefs, 1, 422)
         assertEquals("1 event was rejected by the server (HTTP 422). Check the server URL and token in Setup.",
