@@ -92,6 +92,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-63 | medium | Rust server | Request framing trusted the sender. A repeated `Content-Length` silently used the **last** value, so `Content-Length: 2` followed by `Content-Length: 14` was framed as 14 and the request was applied; a non-numeric value became `0`; `Transfer-Encoding: chunked` was ignored (body dropped); and a body that ended before its declared length was accepted, so a truncated request still mutated state (proved: `Content-Length: 100` + `{}` + EOF registered a child). RFC 7230 §3.3.3 requires rejecting conflicting lengths and unsupported transfer codings. | `content_length = value.parse::<usize>().ok()` (last wins, `None` ⇒ 0) and `body.truncate(cl)` after `break` on EOF | **Fixed 2026-11-19** — lengths must be ASCII digits, repeated lengths must agree, any `Transfer-Encoding` is refused, and `body.len() < cl` is a `400`; tests `conflicting_duplicate_content_length_is_rejected`, `identical_duplicate_content_length_is_accepted`, `non_numeric_content_length_is_rejected`, `truncated_body_is_rejected`, `transfer_encoding_is_rejected`; live probe: four malformed shapes → `400`, identical duplicate + valid → `200`, only the two valid children stored |
 | F-64 | medium | Dashboard | Screen time was credited per package from that package's previous event. With WhatsApp 0–100 s and Instagram 100–300 s, WhatsApp got the entire 300 s span **and** Instagram got its 100 s: 400 s of screen time inside a 300 s window, shown to the parent as fact. | `last_active[pkg]`, then `min(ts - prev, max_gap)` per package | **Fixed 2026-11-19** — walk the merged timeline once and attribute each gap to the app that was on screen when it started; `test_foreground_switch_credits_only_the_app_on_screen`; pre-fix probe returned WhatsApp 300,000 ms + Instagram 100,000 ms inside a 300,000 ms window; live `--screen-time` now shows Instagram 3m, WhatsApp 1m |
 | F-65 | low | Dashboard | `pkg_name` used the last package segment, so `com.instagram.android` displayed as **Android** and `com.google.android.apps.messaging` as **Messaging** only by luck. | `pkg.split(".")[-1].capitalize()` | **Fixed 2026-11-19** — platform suffixes (`android`, `app`, `apps`, `client`, `mobile`, `beta`, `debug`) are stripped before labeling; `test_package_labels_skip_platform_segments` |
+| F-66 | low | Node collector | `limit` disagreed with the Rust collector. `parseInt` accepted `5.9` as 5 and `12abc` as 12, and `limit=0` returned the **default 200** instead of none, because the default check treated 0 as "unset". Rust returns 0 events for `limit=0` and falls back for non-numeric values, so the same request returned different data depending on which collector was running. | `parseInt(raw, 10)` + `n <= 0 ⇒ fallback` | **Fixed 2026-11-20** — only ASCII digits are accepted, `Number.isSafeInteger` rejects overflow, and `tail()` handles 0 explicitly because `slice(-0)` returns the whole list; smoke test covers `0`, `5.9` and `1`; live side-by-side (Rust 38080 / Node 38081) now identical for `0, 2, 5.9, abc, -1` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -761,14 +762,46 @@ Instagram   3m  ####
 Whatsapp    1m  ##
 ```
 
+## 5p. Daily audit — 2026-11-20, collector-parity pass
+
+The README presents the Rust and Node collectors as interchangeable. They were
+not interchangeable for `limit`.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| `limit=0` | Node returned the default 200; Rust returned none | Explicit 0 ⇒ empty list (`slice(-0)` trap) | smoke `limit=0` |
+| `limit=5.9` | Node truncated to 5; Rust fell back | Digits-only parsing | smoke `5.9` |
+| Overflow | `Number()` can be `Infinity` | `Number.isSafeInteger` | code review + fallback test |
+
+Why these shapes:
+
+- **Parity is a promise to the operator.** A script that pages with `limit`
+  should not change behavior when the collector is swapped. Matching the
+  stricter parser is safer than teaching Rust to truncate decimals.
+- **`slice(-0)` is a trap.** `-0` is `0` in JavaScript, so a naive fix for 0
+  would return *every* event — the largest possible answer for the smallest
+  requested limit. `tail()` makes the intent explicit.
+- **Non-numeric means unset.** Falling back to the default keeps a typo from
+  turning into an empty dashboard.
+
+Live side-by-side, same three events posted to each collector:
+
+```
+limit=0    rust 0 events   node 0 events
+limit=2    rust 2 events   node 2 events
+limit=5.9  rust 3 events   node 3 events   (fallback)
+limit=abc  rust 3 events   node 3 events   (fallback)
+limit=-1   rust 3 events   node 3 events   (fallback)
+```
+
 ## 6. Verification log (this audit)
 
 ```
 server-rust:  cargo test            → 33 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
-              non-disclosure, dedupe, caps, ts coercion, LRU eviction,
-              field clipping, stream limit, liveness)
+              non-disclosure, dedupe, caps, limit parsing, ts coercion,
+              LRU eviction, field clipping, stream limit, liveness)
 android:      56 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,

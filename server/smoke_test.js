@@ -103,6 +103,16 @@ function openStream() {
   assert.strictEqual(stored[0].data, 'hello');
   assert.strictEqual(stored[0].ts, 1234, 'device timestamp was overwritten');
 
+  // 5b. `limit` matches the Rust collector: 0 means none, and a value that
+  //     is not plain digits falls back to the default instead of parseInt
+  //     silently truncating "5.9" to 5. slice(-0) used to return everything.
+  const none = JSON.parse((await request('GET', '/api/events?limit=0')).body);
+  assert.strictEqual(none.events.length, 0, 'limit=0 must return no events');
+  const junkLimit = JSON.parse((await request('GET', '/api/events?limit=5.9')).body);
+  assert.strictEqual(junkLimit.events.length, 1, 'a non-integer limit must fall back');
+  const one = JSON.parse((await request('GET', '/api/events?limit=1')).body);
+  assert.strictEqual(one.events.length, 1, 'a valid limit must still work');
+
   // 6. Oversized bodies are rejected instead of buffered without bound.
   const huge = { childId: 'x', events: [], pad: 'a'.repeat(2 * 1024 * 1024 + 1) };
   const big = await request('POST', '/api/events', huge);
@@ -194,7 +204,7 @@ function openStream() {
   assert.strictEqual(s3.code, 200, 'stream slot was not released on disconnect');
   s3.req.destroy();
 
-  console.log('SMOKE OK: auth, token non-disclosure, dedupe, caps, ts coercion, LRU eviction, field clipping, stream limit, and liveness');
+  console.log('SMOKE OK: auth, token non-disclosure, dedupe, caps, limit parsing, ts coercion, LRU eviction, field clipping, stream limit, and liveness');
   srv.kill();
   process.exit(0);
 })().catch(e => {

@@ -194,11 +194,22 @@ function getStats() {
   };
 }
 
-/** Parse a positive limit, falling back to the default and capping output. */
+/** Parse a limit, falling back to the default and capping the result.
+ *
+ * Mirrors the Rust collector: only ASCII digits are accepted, so "5.9" and
+ * "12abc" fall back instead of being silently truncated by parseInt. Zero is
+ * a real limit ("none") and must not be replaced by the default.
+ */
 function limitParam(raw, fallback, max) {
-  const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return fallback;
+  if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) return fallback;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n)) return fallback;
   return Math.min(n, max);
+}
+
+/** The last `limit` items. slice(-0) returns the whole list, so be explicit. */
+function tail(list, limit) {
+  return limit <= 0 ? [] : list.slice(-limit);
 }
 
 const server = http.createServer((req, res) => {
@@ -286,7 +297,7 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/alerts') {
     const limit = limitParam(url.searchParams.get('limit'), 100, MAX_ALERTS);
     sendJson(res, 200, {
-      alerts: state.alerts.slice(-limit).reverse(),
+      alerts: tail(state.alerts, limit).reverse(),
       total: state.alerts.length,
     });
     return;
@@ -295,7 +306,7 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/events') {
     const limit = limitParam(url.searchParams.get('limit'), 200, MAX_EVENTS);
     sendJson(res, 200, {
-      events: state.events.slice(-limit).reverse(),
+      events: tail(state.events, limit).reverse(),
       total: state.events.length,
     });
     return;
