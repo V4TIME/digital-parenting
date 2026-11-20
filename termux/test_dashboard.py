@@ -9,7 +9,9 @@ These tests drive the real CLI in a throwaway CHILDGUARD_HOME so they check
 the same code path a parent uses, not a reimplementation.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -18,7 +20,9 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DASHBOARD = os.path.join(HERE, "dashboard.py")
@@ -364,6 +368,74 @@ class ConfigPermissionTest(unittest.TestCase):
         leftovers = [n for n in os.listdir(exports) if n != bundles[0]]
         self.assertEqual([], leftovers, f"temp export files left behind: {leftovers}")
 
+
+    def test_sync_sanitizes_zero_negative_and_future_timestamps(self):
+        dd = self._load_dashboard()
+        con = dd.ensure_env()
+        now = int(time.time() * 1000)
+        payload = {"events": [
+            {"id": "zero", "ts": 0, "type": "keylog", "package": "p", "data": "zero"},
+            {"id": "negative", "ts": -5, "type": "keylog", "package": "p", "data": "negative"},
+            {"id": "future", "ts": now + 10 * 3600 * 1000,
+             "type": "keylog", "package": "p", "data": "future"},
+            {"id": "inf", "ts": float("inf"), "type": "keylog", "package": "p", "data": "inf"},
+        ]}
+
+        def fake_get(url, token, timeout=10):
+            return payload if "/api/events" in url else {"alerts": []}
+
+        original = dd.http_get_json
+        dd.http_get_json = fake_get
+        try:
+            added = dd.sync_from_server(con, {"server": "http://x", "token": "t"},
+                                        verbose=False)
+        finally:
+            dd.http_get_json = original
+        self.assertEqual(4, added, "every row must still be stored")
+
+        rows = dict(con.execute("SELECT id, ts FROM events").fetchall())
+        after = int(time.time() * 1000)
+        # Both collectors treat 0/negative/non-finite as "now"; the dashboard
+        # used to store 1970 for 0 and crash the row loop on Infinity.
+        for key in ("zero", "negative", "inf"):
+            self.assertGreater(rows[key], now - 5000, f"{key} was filed at {rows[key]}")
+            self.assertLessEqual(rows[key], after + 1000)
+        # A phone one hour ahead is accepted; more than that is clock skew.
+        self.assertGreater(rows["future"], after, "future ts was reset instead of clamped")
+        self.assertLessEqual(rows["future"], after + dd.TS_FUTURE_ALLOWANCE_MS)
+        con.close()
+
+    def test_two_exports_in_the_same_second_do_not_overwrite(self):
+        dd = self._load_dashboard()
+        con = dd.ensure_env()
+        con.execute(
+            "INSERT INTO events(id,ts,type,package,data,child) VALUES(?,?,?,?,?,?)",
+            ("e1", int(time.time() * 1000), "keylog", "com.whatsapp", "hello", "c"),
+        )
+        con.commit()
+
+        # The bundle name only has second resolution. Two exports in one
+        # second used to truncate the first bundle (O_TRUNC, same name).
+        with unittest.mock.patch.object(dd.time, "strftime",
+                                        return_value="20260101-000000"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                dd.do_export(con)
+                dd.do_export(con)
+        con.close()
+
+        exports = os.path.join(self.home, "exports")
+        bundles = sorted(n for n in os.listdir(exports) if n.endswith(".tar.gz"))
+        self.assertEqual(2, len(bundles), f"same-second export overwrote: {bundles}")
+        self.assertIn("childguard_logs_20260101-000000.tar.gz", bundles)
+        self.assertIn("childguard_logs_20260101-000000-2.tar.gz", bundles)
+        for name in bundles:
+            path = os.path.join(exports, name)
+            self.assertEqual(0o600, stat.S_IMODE(os.stat(path).st_mode))
+            with tarfile.open(path, "r:gz") as tar:
+                self.assertIn("events.jsonl", tar.getnames())
+                self.assertIn(b"hello", tar.extractfile("events.jsonl").read())
+        leftovers = [n for n in os.listdir(exports) if not n.endswith(".tar.gz")]
+        self.assertEqual([], leftovers, f"staging files left behind: {leftovers}")
 
     def _start_fake_server(self, routes):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

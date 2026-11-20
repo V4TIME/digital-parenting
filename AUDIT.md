@@ -97,6 +97,8 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-68 | low | Android | Registration read its reply with `bufferedReader().readText()`, with no size limit. A proxy or broken server answering 200 with a large page buffered it all into the app heap. | unbounded `readText()` | **Fixed 2026-11-20** — `readAtMost(input, 8 KiB)`; a malformed 200 now keeps the pending id and retries instead of being trusted; non-200 outcomes are logged with the status; `registrationResponseReadIsBounded` |
 | F-69 | medium | Android | Events the server permanently rejected (`400`/`415`/`422`, after the batch was split down to the single poison event) were dropped, and the app incremented `dropped_events_total` — which **nothing ever read**. The dashboard kept saying "Monitoring: ON" while captured evidence disappeared, so a parent had no way to learn that the endpoint or token was wrong. | `recordDropped()` wrote a pref; no reader | **Fixed 2026-11-20** — the dashboard shows a red `tv_dropped` line (`"3 events were rejected by the server (HTTP 400). Check the server URL and token in Setup."`), refreshed on every resume; the ongoing notification is re-posted with the count; changing the server URL or token in Setup clears the historical count. Tests: `rejectedEventsAreVisibleOnTheDashboard`, `droppedCounterAccumulatesAndReadsNaturally`, `notificationSurfacesRejectedEvents`, `changingTheEndpointClearsTheStaleLossCounter` |
 | F-70 | medium | Android | The upload loop was a single self-posting `Runnable` that re-armed via the `uploadHandler` **field**. `stopUploadLoop()` used `quitSafely()`, so a pass already running finished after `stop` and then posted itself onto the *new* loop's handler. Every STOP→START added another permanent chain: two, three, … full batches hitting the collector every 15 s, with duplicate uploads and extra radio wake-ups. | single `uploadRunnable` + `uploadHandler?.postDelayed(this, delay)` | **Fixed 2026-11-20** — each loop captures its own `Handler` and a `@Volatile` generation; a pass from a dead generation returns without rescheduling. `restartingTheLoopDoesNotDoubleTheUploadRate` fails on the old shape (`expected:<1> but was:<2>`) and passes on the fix |
+| F-71 | low | Dashboard | Sync copied the server's timestamp by type only: `int(float(raw))`. Both collectors treat `0`/negative/missing as "now" and clamp clock skew to +1 h, but the dashboard stored `0` as **1970** (sorted below every real event and ruining screen-time windows) and a JSON `1e400` (Python `inf`) raised `OverflowError`, which the per-row `except` swallowed — the event vanished. | `try: int(float(raw)) except (TypeError, ValueError): now` | **Fixed 2026-11-20** — the same policy as Rust/Node: non-finite or `<= 0` ⇒ `now`, future values clamped to `now + 1 h`; `test_sync_sanitizes_zero_negative_and_future_timestamps` (old code stores 3 of 4 rows) |
+| F-72 | low | Dashboard | Export names used `time.strftime("%Y%m%d-%H%M%S")` and `O_TRUNC`. Two exports in the same second — a retry, a double invocation, or two shells — silently overwrote the first bundle, and the staging `.jsonl` names could collide between concurrent runs. | second-resolution name + `O_TRUNC`, fixed `events_{stamp}.jsonl` names | **Fixed 2026-11-20** — the bundle is claimed atomically with `O_EXCL` (`name.tar.gz`, `name-2.tar.gz`, …) and staging files use `tempfile.mkstemp`; a failed export removes the partial bundle and closes its fd. `test_two_exports_in_the_same_second_do_not_overwrite` (old code leaves 1 bundle) |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -889,6 +891,48 @@ tv_dropped.text = "3 events were rejected by the server (HTTP 400).
                    Check the server URL and token in Setup."
 ```
 
+## 5s. Daily audit — 2026-11-20, dashboard sync/export parity pass
+
+The dashboard is the parent-facing copy of the data, but it sanitized less than
+the collectors that produced it.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Timestamps | `0` stored as 1970; `inf` dropped the row | Same rule as Rust/Node: `<= 0`/non-finite ⇒ now, future ⇒ +1 h | 4-row sync test |
+| Exports | Same-second name + `O_TRUNC` overwrote the previous bundle | `O_EXCL` name claim + `mkstemp` staging | 2 exports, 2 bundles |
+
+Why these shapes:
+
+- **The dashboard is allowed to be a cache, not a second policy.** When the
+  collector already decided that `ts=0` means "now", storing 1970 in SQLite is
+  not extra safety; it is a silent contradiction. A future timestamp is kept
+  (clamped), not reset, because a phone one hour ahead is a real clock, not
+  corruption.
+- **`OverflowError` is not a `ValueError`.** JSON has `Infinity`; Python's
+  `json` parses `1e400` to it, and `int(float('inf'))` raises `OverflowError`,
+  which the old handler did not catch. The row was skipped by the broad
+  per-row `except` — one bad record disappeared with no count.
+- **A name is a claim.** `O_TRUNC` says "replace whatever is there"; `O_EXCL`
+  says "this name is mine". Exports contain a child's messages, so silently
+  replacing yesterday's evidence with a zero-byte or half-written file is the
+  worst failure mode. The second bundle gets `-2`, which is obvious in `ls`.
+- **Staging files need the same treatment.** Fixed names meant two concurrent
+  exports scribbled into the same `.jsonl` before archiving. `mkstemp` is
+  already 0600 and unique; the archive members are still forced to 0600.
+
+Proof on the old code (files restored from `HEAD`, new tests kept):
+
+```
+FAIL test_sync_sanitizes_zero_negative_and_future_timestamps
+     AssertionError: 4 != 3 : every row must still be stored
+FAIL test_two_exports_in_the_same_second_do_not_overwrite
+     AssertionError: 2 != 1 : same-second export overwrote:
+     ['childguard_logs_20260101-000000.tar.gz']
+Ran 2 tests ... FAILED (failures=2)
+```
+
+After the fix: `Ran 21 tests ... OK`.
+
 ## 6. Verification log (this audit)
 
 ```
@@ -903,7 +947,7 @@ android:      65 tests, 0 failures, 0 skipped (with live server)
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 8,
               DashboardActivity 5, MonitorServiceLifecycle 6,
               SetupActivity 4, WebMonitorActivity 1
-dashboard:    python3 -m unittest termux/test_dashboard.py → 19 passed
+dashboard:    python3 -m unittest termux/test_dashboard.py → 21 passed
 android:      assembleDebug → app-debug.apk 7,400,129 bytes,
               sha256 0fb30291...645a4
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);

@@ -43,6 +43,7 @@ import shutil
 import sqlite3
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -101,6 +102,10 @@ CONFIG_PATH = os.path.join(BASE, "config.json")
 EXPORT_DIR = os.path.join(BASE, "exports")
 DEFAULT_SERVER = "http://127.0.0.1:38080"
 DEFAULT_TOKEN = ""
+
+# Matches both collectors: a client clock may be up to an hour ahead. A
+# timestamp further in the future is treated as clock skew and clamped.
+TS_FUTURE_ALLOWANCE_MS = 60 * 60 * 1000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -379,10 +384,20 @@ def sync_from_server(con, cfg, verbose=True):
         # INSERT declares ts INTEGER NOT NULL, but a malformed/hostile server
         # response can send a string or null. Coerce to an int instead of
         # letting sqlite raise and silently drop the row.
+        #
+        # Both collectors treat a missing/null/zero/negative timestamp as
+        # "now" and clamp future clock skew to one hour. Copying only the
+        # type coercion here meant a legacy or hand-written record with ts=0
+        # was stored at 1970 and sorted below everything, and 1e400 (JSON
+        # "Infinity") raised OverflowError inside the row loop.
+        now = int(time.time() * 1000)
         try:
-            return int(float(raw))
-        except (TypeError, ValueError):
-            return int(time.time() * 1000)
+            ts = int(float(raw))
+        except (TypeError, ValueError, OverflowError):
+            return now
+        if ts <= 0:
+            return now
+        return min(ts, now + TS_FUTURE_ALLOWANCE_MS)
 
     for ev in _response_list(ev_resp, "events"):
         if not isinstance(ev, dict):
@@ -812,50 +827,88 @@ def _owner_only_tarinfo(ti):
     return ti
 
 
+def _claim_export_path(stamp):
+    """Atomically reserve a bundle name and return (path, fd).
+
+    The stamp has one-second resolution, so a retry or a double invocation in
+    the same second used to truncate the previous bundle. O_EXCL makes the
+    claim race-free and keeps the name readable.
+    """
+    for n in range(1, 1000):
+        suffix = "" if n == 1 else f"-{n}"
+        path = os.path.join(EXPORT_DIR, f"childguard_logs_{stamp}{suffix}.tar.gz")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        return path, fd
+    raise RuntimeError("could not allocate a unique export name")
+
+
+def _private_temp(tag, stamp, suffix):
+    """Create one owner-only staging file with a collision-free name."""
+    fd, path = tempfile.mkstemp(prefix=f"{tag}_{stamp}_", suffix=suffix,
+                                dir=EXPORT_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    return path, os.fdopen(fd, "w", encoding="utf-8")
+
+
 def do_export(con):
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(EXPORT_DIR, f"childguard_logs_{stamp}.tar.gz")
-    tmp_json = os.path.join(EXPORT_DIR, f"events_{stamp}.jsonl")
-    tmp_alerts = os.path.join(EXPORT_DIR, f"alerts_{stamp}.jsonl")
-    cfg_snapshot = os.path.join(EXPORT_DIR, f"config_snapshot_{stamp}.json")
+    path, bundle_fd = _claim_export_path(stamp)
+    tmp_json = tmp_alerts = cfg_snapshot = None
 
     try:
-        with open_private(tmp_json, "w") as f:
+        tmp_json, f = _private_temp("events", stamp, ".jsonl")
+        with f:
             for row in con.execute("SELECT ts,type,package,data,child FROM events ORDER BY ts"):
                 f.write(json.dumps({"ts": row[0], "type": row[1], "package": row[2],
                                     "data": row[3], "child": row[4]}) + "\n")
-        with open_private(tmp_alerts, "w") as f:
+        tmp_alerts, f = _private_temp("alerts", stamp, ".jsonl")
+        with f:
             for row in con.execute("SELECT ts,severity,reason,detail FROM alerts ORDER BY ts"):
                 f.write(json.dumps({"ts": row[0], "severity": row[1],
                                     "reason": row[2], "detail": row[3]}) + "\n")
-        with open_private(cfg_snapshot, "w") as f:
+        cfg_snapshot, f = _private_temp("config_snapshot", stamp, ".json")
+        with f:
             json.dump({
                 "keywords": get_cfg(con, KEYWORD_KEY, []),
                 "blocklist": get_cfg(con, BLOCKLIST_KEY, []),
                 "configured_server": load_config().get("server"),
             }, f, indent=2)
 
-        # Create the tarball itself 0600; chmod-after-write left a readable
-        # window and a crashed export left the file readable forever.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as raw:
-            try:
-                os.fchmod(raw.fileno(), 0o600)
-            except OSError:
-                pass
+        # The bundle was created 0600 by O_EXCL; chmod-after-write left a
+        # readable window and a crashed export left the file readable forever.
+        with os.fdopen(bundle_fd, "wb") as raw:
             with tarfile.open(fileobj=raw, mode="w:gz") as tar:
                 tar.add(tmp_json, arcname="events.jsonl", filter=_owner_only_tarinfo)
                 tar.add(tmp_alerts, arcname="alerts.jsonl", filter=_owner_only_tarinfo)
                 tar.add(cfg_snapshot, arcname="config_snapshot.json",
                         filter=_owner_only_tarinfo)
+        print(green(f"  exported → {path}"))
+    except BaseException:
+        # A failed export must not leave a truncated bundle or an open fd.
         try:
-            os.chmod(path, 0o600)
+            os.close(bundle_fd)
         except OSError:
             pass
-        print(green(f"  exported → {path}"))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
     finally:
         # Interrupted exports must not leave captured messages behind.
         for leftover in (tmp_json, tmp_alerts, cfg_snapshot):
+            if not leftover:
+                continue
             try:
                 os.remove(leftover)
             except OSError:
