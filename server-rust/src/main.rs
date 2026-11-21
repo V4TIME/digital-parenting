@@ -610,8 +610,20 @@ fn authorized(headers: &HashMap<String, String>, token: &str) -> bool {
         Some(h) => h,
         None => return false,
     };
-    let expected = format!("Bearer {}", token);
-    constant_time_eq(hdr, &expected)
+    // HTTP/2 and most clients send "Bearer" with that exact case, but the
+    // scheme is case-insensitive per RFC 7235. A client that sends
+    // "bearer secret" or "BEARER secret" was rejected outright, so the two
+    // collectors disagreed on a request that is perfectly legal.
+    let hdr = hdr.trim();
+    let scheme = hdr
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+        .collect::<String>();
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let rest = hdr[scheme.len()..].trim();
+    constant_time_eq(rest, token)
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,6 +1183,32 @@ mod tests {
         assert!(!constant_time_eq("abc", "abcd"));
         assert!(!constant_time_eq("", "a"));
         assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn auth_scheme_is_case_insensitive() {
+        // RFC 7235 makes the scheme case-insensitive. The old check compared
+        // the whole header against "Bearer <token>", so "bearer secret" and
+        // "BEARER secret" were rejected even though they are valid requests.
+        let state = test_state("secret");
+        for header in [
+            "Bearer secret",
+            "bearer secret",
+            "BEARER secret",
+            "Bearer   secret",
+            "Bearer\tsecret",
+        ] {
+            let mut headers = HashMap::new();
+            headers.insert("authorization".to_string(), header.to_string());
+            assert!(authorized(&headers, &state.lock().unwrap().token),
+                    "scheme-insensitive auth failed for {:?}", header);
+        }
+        // A scheme that is not bearer is still rejected.
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Basic secret".to_string());
+        assert!(!authorized(&headers, &state.lock().unwrap().token));
+        headers.insert("authorization".to_string(), "Bearer wrong".to_string());
+        assert!(!authorized(&headers, &state.lock().unwrap().token));
     }
 
     #[test]

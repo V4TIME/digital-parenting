@@ -70,7 +70,14 @@ function timingSafeEqual(a, b) {
 }
 
 function authorized(req) {
-  return timingSafeEqual(req.headers.authorization || '', `Bearer ${AUTH_TOKEN}`);
+  // HTTP/2 and most clients send "Bearer" with that exact case, but the
+  // scheme is case-insensitive per RFC 7235. Comparing the whole header
+  // against "Bearer <token>" rejected "bearer secret" and "BEARER secret",
+  // which are valid requests, so the two collectors disagreed.
+  const raw = (req.headers.authorization || '').trim();
+  const match = raw.match(/^([A-Za-z][A-Za-z0-9-]*)\s+(.*)$/);
+  if (!match || match[1].toLowerCase() !== 'bearer') return false;
+  return timingSafeEqual(match[2], AUTH_TOKEN);
 }
 
 function sendJson(res, code, obj) {

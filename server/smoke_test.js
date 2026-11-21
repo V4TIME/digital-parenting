@@ -79,6 +79,41 @@ function openStream() {
   const bad = await request('POST', '/api/events', { childId: 'x', events: [] }, 'wrong');
   assert.strictEqual(bad.code, 401, 'wrong token was not rejected');
 
+  // 3b. The scheme is case-insensitive per RFC 7235. The old Node check
+  //     compared the whole header against "Bearer <token>", so "bearer ..."
+  //     and "BEARER ..." were rejected even though they are valid requests.
+  for (const scheme of ['bearer', 'BEARER', 'BeArEr']) {
+    const ok = await new Promise((resolve, reject) => {
+      const data = JSON.stringify({ childId: 'cg_never_registered', events: [] });
+      const req = http.request({
+        host: '127.0.0.1', port: PORT, path: '/api/events', method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+          Authorization: `${scheme} ${TOKEN}`,
+        },
+      }, res => { res.resume(); resolve(res.statusCode); });
+      req.on('error', reject);
+      req.end(data);   // Content-Length is set, so the body must be sent
+    });
+    assert.strictEqual(ok, 200, `scheme ${scheme} was rejected`);
+  }
+  // A scheme that is not bearer is still rejected.
+  const notBearer = await new Promise((resolve, reject) => {
+    const data = JSON.stringify({ childId: 'cg_never_registered', events: [] });
+    const req = http.request({
+      host: '127.0.0.1', port: PORT, path: '/api/events', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+        Authorization: `Basic ${TOKEN}`,
+      },
+    }, res => { res.resume(); resolve(res.statusCode); });
+    req.on('error', reject);
+    req.end(data);
+  });
+  assert.strictEqual(notBearer, 401, 'Basic scheme was accepted');
+
   // 4. Missing childId is a client error, not a stored event.
   const noChild = await request('POST', '/api/events', { events: [] });
   assert.strictEqual(noChild.code, 400, 'missing childId should be 400');

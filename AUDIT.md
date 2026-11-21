@@ -102,6 +102,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-73 | low | Rust collector | An oversized header region was answered with **413 Payload Too Large**, and the read loop did not enforce the 64 KiB header budget while waiting for `\r\n\r\n`: it buffered up to `MAX_BODY + 64 KiB` (~2.1 MiB) and, with a client that keeps writing, held the connection until the 30 s deadline. Node's HTTP parser answers 431 at its 16 KiB limit, so the collectors also disagreed. | `split > MAX_HEADER_REGION ⇒ 413`, no early cap | **Fixed 2026-11-20** — the loop returns `431` as soon as the unterminated header region exceeds 64 KiB, and a terminated oversized block is `431`; the reason phrase and log text were added. Tests `an_oversized_header_block_is_431_not_413` and `an_unterminated_header_flood_is_431_without_buffering_the_body_cap` (old code: 413 and a 10 s 408). Live: 70 KiB headers → `431` in 1.9 ms / 1.6 ms; valid request → `200` |
 | F-74 | medium | Android | A wrong token, a dead tailnet, or an unreachable collector left the dashboard at "Monitoring: ON" with **no uploads and no message**. `ensureRegistered`/upload failures only wrote `Log.w`; events were correctly kept for retry, but the parent had no way to distinguish "nothing happened" from "nothing is arriving". | failures logged only; warning state did not exist | **Fixed 2026-11-20** — the current upload problem is persisted (`last_upload_error` + timestamp) and shown as an amber dashboard line ("Uploads failing since 12:04 — server answered HTTP 401. Retrying automatically."); it is cleared by any 2xx or reachable-but-rejected batch, and the same marker covers registration failures. Tests: `currentUploadProblemIsVisibleAndClearsWhenFixed`; the live E2E dead-port test now asserts the warning appears and clears after recovery |
 | F-75 | medium | Android | Both capture queues are capped at 200 events, but the eviction was silent: `while (queue.size >= MAX_QUEUE) queue.poll()` threw the **oldest** captured message away with no counter, no dashboard line, and no notification. A phone that was offline for a few minutes (or a very chatty group chat) lost evidence while the UI still promised capture — the same "silent loss" class as F-69, one layer lower. | `queue.poll()` with no accounting | **Fixed 2026-11-20** — evictions are counted and recorded through the durable loss counter with code `0` (`recordLocalLoss`), so the dashboard says "N events were lost locally: the capture queue was full. Check the server connection."; the counter is written only when something was actually evicted. Tests: `aFullCaptureQueueDropsTheOldestEventLoudly` (old shape: `expected:<1> but was:<0>`), `notificationQueueOverflowIsCountedNotSilent` (`expected:<60> but was:<0>`), `localQueueOverflowIsReportedAsLocalNotAsAServerError` |
+| F-76 | low | Both collectors | `authorized()` compared the **whole** `Authorization` value against `"Bearer <token>"`, so the scheme was case-sensitive. RFC 7235 makes auth schemes case-insensitive, and `bearer <token>` / `BEARER <token>` (or extra spaces after the scheme) are valid requests that both collectors answered `401`. The Android client always sends `Bearer`, which is why no test caught it. | exact string compare in Rust and Node | **Fixed 2026-11-21** — both parse the scheme case-insensitively and then compare **only the credential** in constant time (a non-`Bearer` scheme is still rejected). Rust `auth_scheme_is_case_insensitive` fails on the old code; the Node smoke test fails with `scheme bearer was rejected 401 !== 200` |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -1051,10 +1052,46 @@ Feature3NotificationTest > notificationQueueOverflowIsCountedNotSilent FAILED
 On the fix: `Feature1RuntimeTest tests=12 failures=0`,
 `Feature3NotificationTest tests=12 failures=0`, `DashboardActivityTest tests=7 failures=0`.
 
+## 5w. Daily audit — 2026-11-21, auth scheme parity
+
+A small spec-compliance gap that both collectors shared, found by asking what a
+non-Android client would send.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Rust auth | whole header compared literally | parse scheme case-insensitively, then compare the credential | unit test fails pre-fix |
+| Node auth | same | same | smoke fails pre-fix (`401 !== 200`) |
+| Non-Bearer scheme | n/a | still rejected | included in both tests |
+
+Why this shape:
+
+- **RFC 7235 §2.1:** "The scheme name is case-insensitive." A proxy, a
+  hand-written `curl`, or a future client may normalize it; rejecting a
+  request that is legal is a bug even if our own app never triggers it.
+- **Only the credential is compared in constant time.** Extracting the scheme
+  first means the secret comparison still takes the same time regardless of
+  where the token differs; the scheme itself is not secret.
+- **Whitespace is normalized once.** `Bearer    token` was rejected before;
+  `\s+` (Node) and `trim()` (Rust) accept the legal form without accepting
+  `Bearer` alone or `Basic token`.
+- **Both collectors changed together.** Parity matters more than the fix: a
+  script that works against Node must work against Rust, or the "drop-in
+  replacement" claim in the README is false.
+
+Proof, old shapes:
+
+```
+rust: auth_scheme_is_case_insensitive ... FAILED   (old: "bearer secret" rejected)
+node: SMOKE FAIL: scheme bearer was rejected
+      401 !== 200
+```
+
+After: `cargo test` → 38 passed; Node smoke prints `SMOKE OK`.
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 37 passed; 0 failed
+server-rust:  cargo test            → 38 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,
