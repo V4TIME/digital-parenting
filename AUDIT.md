@@ -105,6 +105,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-76 | low | Both collectors | `authorized()` compared the **whole** `Authorization` value against `"Bearer <token>"`, so the scheme was case-sensitive. RFC 7235 makes auth schemes case-insensitive, and `bearer <token>` / `BEARER <token>` (or extra spaces after the scheme) are valid requests that both collectors answered `401`. The Android client always sends `Bearer`, which is why no test caught it. | exact string compare in Rust and Node | **Fixed 2026-11-21** — both parse the scheme case-insensitively and then compare **only the credential** in constant time (a non-`Bearer` scheme is still rejected). Rust `auth_scheme_is_case_insensitive` fails on the old code; the Node smoke test fails with `scheme bearer was rejected 401 !== 200` |
 | F-77 | medium | Android | The retry queue (`MAX_RETRY = 1000`) evicted its oldest event on overflow with `retryQueue.poll()` and no accounting. Those events had already been **drained out of** the capture queues for upload, so during a long outage the retry queue is their only copy: F-75 made a full capture queue visible, but the last layer still dropped evidence silently. | silent `poll()` in `requeue()` | **Fixed 2026-11-21** — `requeue()` returns the number it had to evict and `requeueOrCount()` records it through `recordLocalLoss`, so the same dashboard line and durable counter cover all three layers. Tests: `retryQueueOverflowIsCountedNotSilent` (old shape `expected:<1> but was:<0>`), `retryCapReportsWhatItEvicts` (`expected:<1> but was:<0>`) |
 | F-78 | **high (phone safety)** | Both collectors | The collector bound `0.0.0.0` by default, so starting it on a shared Wi-Fi (café, hotel, school, office guest SSID) published a service holding a child's messages to every peer on that network. `BIND=` (empty) was worse: it produced `":38080"`, which also binds every interface. Every response carried `Access-Control-Allow-Origin: *`, so any web page opened in a browser on the phone could probe the port (and with the token, read or write events). The token was the only gate, and short tokens are allowed. | `BIND` default `0.0.0.0`, empty ⇒ all interfaces; CORS `*` unconditional | **Fixed 2026-11-21** — loopback is the default (`bind_or_default` in Rust, `BIND || '127.0.0.1'` in Node; blank ⇒ loopback), startup prints how to opt in, and CORS is off unless `CHILDGUARD_CORS=1`. The app is unaffected (it is not a browser); exposing the child's phone is now an explicit `BIND=<tailnet/hotspot IP>`. Tests: `bind_defaults_to_loopback`, `cors_headers_are_opt_in`, Node smoke (no ACAO, loopback bind, LAN probe refused) |
+| F-79 | **high (token disclosure)** | Dashboard | `http_get_json()` used the default `urllib.request.urlopen`, whose redirect handler follows 301/302/303/307/308 and copies **every** header except `Content-Length`/`Content-Type` into the new request — including `Authorization: Bearer <parent token>`. A collector URL that redirects (a typo, a tampered `config.json`, a hostile host on the LAN) therefore received the token, which is the only credential protecting the collector. The same opener also handles `file:`, `ftp:` and `data:` URLs, and `--configure` saved any `--server` string without validation, so `file:///…` made the dashboard read a local file. | default opener; no scheme, host or userinfo check | **Fixed 2026-11-21** — `validate_server_url()` accepts only `http`/`https` with a host and no userinfo; a custom `_RefuseRedirects` opener turns any 3xx into an error (the collector never redirects); `--configure` and the interactive form reject a bad URL before `config.json` is written. Tests: `test_http_get_json_refuses_redirect_without_forwarding_the_token` (old code: sink received `Bearer parent-token-123`), `test_http_get_json_allows_only_http_and_https` (old code read `file:` and `data:`), `test_http_get_json_rejects_credentials_in_the_url`, `test_configure_refuses_a_non_http_server_before_saving` (old code exited 0 and saved `file:///etc/passwd`) |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -1176,6 +1177,59 @@ node: SMOKE FAIL: collector did not bind loopback by default:
 rust: bind_defaults_to_loopback / cors_headers_are_opt_in
 ```
 
+## 5z. Daily audit — 2026-11-21, dashboard connection hardening
+
+The parent-facing control panel is a CLI that **makes** one kind of network
+call: `GET` to the collector, with the bearer token. It **serves** nothing. That
+asymmetry is the safety property. This pass hardened the outbound side.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Redirects | default opener forwards `Authorization` to the new host | every 3xx is an error | live two-server test; old code leaked `Bearer parent-token-123` |
+| Schemes | `file:`, `ftp:`, `data:` were handled by the same opener | allowlist `http`/`https` | old code returned a local file's JSON; `data:` also parsed |
+| URL shape | empty host and `user:pass@host` accepted | host required, userinfo rejected | unit tests |
+| Configure | saved any `--server` value | validate before writing | old code exit 0 and `configured server=file:///etc/passwd` |
+| Export perms | already 0700/0600 (earlier pass) | unchanged | existing tests |
+
+Old shapes, new tests:
+
+```
+redirect:   AssertionError: [] != [{... 'authorization': 'Bearer parent-token-123' ...}]
+file://     AssertionError: ValueError not raised
+data:       AssertionError: ValueError not raised
+configure:  AssertionError: 2 != 0 : configured server=file:///etc/passwd
+```
+
+### Why the panel is not an HTTP server
+
+The endpoint set that usually accompanies a browser console — `/logs`,
+`/devices`, `/logs/download`, `/logs/clear`, `/ping`, a `handleUI()` page —
+would put those capabilities **on the phone**, reachable by anything that can
+open a socket to it. The dashboard deliberately has none of them:
+
+- **Nothing listens.** There is no `HTTPServer`, no port, no CORS, no cookie.
+  A stranger on the same Wi-Fi, a malicious app, or a web page cannot reach a
+  CLI that only reads and exits.
+- **The dangerous handlers are the ones with side effects.** `handleClear()`
+  and `handleDownload()` are the two that destroy or export a child's data.
+  Over HTTP they become a CSRF target (a web page can `POST /logs/clear`
+  without reading the response) and a path-traversal target (a `name`/`format`
+  query parameter feeding an export path). `handleUI()` adds XSS: every log
+  line is attacker-influenced text rendered in a browser.
+- **The collector already has the read API.** The dashboard pulls `/api/events`
+  and `/api/alerts` over loopback and writes a `0600` SQLite cache. Sync is
+  one-way; there is no route that clears the collector.
+- **Terminal output is not HTML.** `safe_text()` strips C0/C1 controls and
+  bidi overrides before printing, so a log line cannot rewrite the screen.
+  A browser UI would need HTML escaping, CSP, and a CSRF token instead.
+
+If a browser panel is ever wanted, the minimum shape is: bind `127.0.0.1` only,
+require the bearer token on **every** route including the page, expose no
+`GET` mutation (clear/delete must be `POST` with a CSRF token and a
+same-origin check), never put the token in a URL or cookie, and keep export
+paths server-generated rather than client-supplied. That is a new feature with
+a new attack surface, not a change to make silently.
+
 ## 6. Verification log (this audit)
 
 ```
@@ -1190,7 +1244,7 @@ android:      71 tests, 0 failures, 0 skipped (with live server)
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 8,
               DashboardActivity 7, MonitorServiceLifecycle 7,
               SetupActivity 4, WebMonitorActivity 1
-dashboard:    python3 -m unittest termux/test_dashboard.py → 21 passed
+dashboard:    python3 -m unittest termux/test_dashboard.py → 25 passed
 android:      assembleDebug → app-debug.apk 7,400,169 bytes,
               sha256 5e8ce1c7...e9baa
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);

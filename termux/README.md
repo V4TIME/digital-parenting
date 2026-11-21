@@ -85,6 +85,19 @@ atomically `0600` inside a `0700` directory. You can also pre-write it:
 { "server": "http://192.168.1.50:38080", "token": "your_token_here" }
 ```
 
+### Connection rules (enforced)
+
+- **`http`/`https` only.** `file:`, `ftp:` and `data:` URLs are rejected, so a
+  typo or a tampered config cannot make the dashboard read a local file.
+- **No credentials in the URL.** `http://user:pass@host/` is rejected; the only
+  credential is the bearer token the dashboard adds itself.
+- **No redirects.** The collector never redirects, and a 3xx is treated as an
+  error. `urllib` would otherwise copy `Authorization` to the redirect target,
+  handing the parent token to a different host.
+- **Outbound only.** The dashboard opens no port and serves no HTML. There is
+  nothing on the phone for another app, a web page, or a Wi-Fi peer to connect
+  to; see §5z of `AUDIT.md` for what a browser panel would add.
+
 ## Server requirements
 
 The Node server (`../server/index.js`) exposes:

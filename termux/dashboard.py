@@ -47,6 +47,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # --------------------------------------------------------------------------
 # ANSI helpers
@@ -247,12 +248,74 @@ def set_cfg(con, key, value):
 # multi-gigabyte body and exhaust Termux memory; read at most this much.
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
+ALLOWED_SCHEMES = ("http", "https")
+
+
+def validate_server_url(url):
+    """Accept only a plain http(s) URL with a host and no credentials.
+
+    `urllib`'s default opener also handles `file:`, `ftp:` and `data:` URLs.
+    The URL comes from the config file or a `--server` argument, so without a
+    check a typo (or a tampered config) could make the dashboard read a local
+    file or speak a protocol the collector never uses. The first-party
+    clients only ever need http/https.
+
+    Userinfo is rejected too: `http://user:pass@host/` invites credential
+    confusion, and the dashboard has exactly one credential — the bearer
+    token it adds itself.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("server URL is empty")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ALLOWED_SCHEMES:
+        raise ValueError(
+            f"unsupported URL scheme {parts.scheme or '(none)'!r}; use http or https")
+    if not parts.hostname:
+        raise ValueError(f"server URL has no host: {safe_text(url)!r}")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("server URL must not contain credentials")
+    return url
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Turn any 3xx into an error.
+
+    urllib's redirect handler copies every header except Content-Length and
+    Content-Type into the new request, so following a 302 to another host
+    sends `Authorization: Bearer <parent token>` to that host. The collector
+    never redirects, so a 3xx is either a misconfiguration or an attempt to
+    move the token off-device. Refusing keeps the token on the URL the parent
+    configured.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            fp.close()
+        except Exception:
+            pass
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"refusing to follow redirect to {safe_text(newurl)}",
+            headers,
+            None,
+        )
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
+def _urlopen(req, timeout):
+    """Single choke point for HTTP, so tests and redirect policy share it."""
+    return _OPENER.open(req, timeout=timeout)
+
 
 def http_get_json(url, token, timeout=10):
+    validate_server_url(url)
     req = urllib.request.Request(url)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _urlopen(req, timeout=timeout) as resp:
         # Read in bounded chunks so a missing/incorrect Content-Length cannot
         # make .read() allocate without limit.
         buf = bytearray()
@@ -790,7 +853,12 @@ def configure(con):
     print(bold("  Configure connection"))
     cur = input(f"  server URL [{safe_text(cfg.get('server', DEFAULT_SERVER))}]: ").strip()
     if cur:
-        cfg["server"] = cur.rstrip("/")
+        try:
+            cfg["server"] = validate_server_url(cur.rstrip("/"))
+        except ValueError as e:
+            print(red(f"  {safe_text(e)}"))
+            print(dim("  not saved; keeping the previous server and token"))
+            return
     current_token = cfg.get("token", "")
     # Never echo the secret into the terminal or its scrollback. Enter keeps it.
     hint = f"set, {len(current_token)} chars" if current_token else "unset"
@@ -1008,7 +1076,11 @@ def main():
 
     if args.configure:
         if args.server:
-            cfg["server"] = args.server.rstrip("/")
+            try:
+                cfg["server"] = validate_server_url(args.server.rstrip("/"))
+            except ValueError as e:
+                print(red(f"  bad server URL: {safe_text(e)}"))
+                sys.exit(2)
         if args.token is not None:
             cfg["token"] = args.token
         save_config(cfg)

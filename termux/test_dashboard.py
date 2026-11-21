@@ -262,16 +262,123 @@ class ConfigPermissionTest(unittest.TestCase):
 
         chunk = b"x" * 65536
         count = (dd.MAX_RESPONSE_BYTES // len(chunk)) + 2
-        original = dd.urllib.request.urlopen
-        dd.urllib.request.urlopen = lambda req, timeout=10: FakeResponse(
-            [chunk] * count
-        )
+        original = dd._urlopen
+        dd._urlopen = lambda req, timeout=10: FakeResponse([chunk] * count)
         try:
             with self.assertRaises(ValueError) as ctx:
                 dd.http_get_json("http://x/api/events", "t")
             self.assertIn("exceeded", str(ctx.exception))
         finally:
-            dd.urllib.request.urlopen = original
+            dd._urlopen = original
+
+    def test_http_get_json_refuses_redirect_without_forwarding_the_token(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = []
+
+        class Sink(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append({k.lower(): v for k, v in self.headers.items()})
+                raw = b'{"ok":true,"service":"sink"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        sink = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+        threading.Thread(target=sink.serve_forever, daemon=True).start()
+        self.addCleanup(sink.server_close)
+        self.addCleanup(sink.shutdown)
+
+        sink_port = sink.server_address[1]
+
+        class Redirector(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://127.0.0.1:{sink_port}/steal")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        redir = ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=redir.serve_forever, daemon=True).start()
+        self.addCleanup(redir.server_close)
+        self.addCleanup(redir.shutdown)
+
+        dd = self._load_dashboard()
+        err = None
+        try:
+            dd.http_get_json(
+                f"http://127.0.0.1:{redir.server_address[1]}/api/events",
+                "parent-token-123",
+            )
+        except Exception as exc:  # noqa: BLE001 - the class matters less than the effect
+            err = exc
+        time.sleep(0.2)  # give a followed redirect time to reach the sink
+
+        # urllib copies every header except Content-Length/Content-Type into
+        # the redirected request, so following a 302 hands the parent bearer
+        # token to whatever host the redirect names.
+        self.assertEqual(
+            [], seen,
+            "credential was forwarded to the redirect target: "
+            f"{seen[0].get('authorization') if seen else None!r}")
+        self.assertIsNotNone(err, "a redirect was followed instead of refused")
+        self.assertIn("redirect", str(err).lower())
+
+    def test_http_get_json_allows_only_http_and_https(self):
+        dd = self._load_dashboard()
+        local = os.path.join(self.home, "local.json")
+        with open(local, "w", encoding="utf-8") as f:
+            json.dump({"events": ["read from a local file"]}, f)
+
+        # urllib's default opener also understands file:, ftp: and data:, so a
+        # config value or a --server argument could make the dashboard read a
+        # local file or speak a protocol the collector never uses.
+        for url in (
+            f"file://{local}",
+            "ftp://127.0.0.1/nope",
+            "data:application/json,%7B%22ok%22%3Atrue%7D",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError) as ctx:
+                    dd.http_get_json(url, "")
+                self.assertIn("scheme", str(ctx.exception).lower())
+
+        # https must still be accepted (no connection is made here).
+        self.assertEqual(
+            "https://collector.example:443",
+            dd.validate_server_url("https://collector.example:443"),
+        )
+
+    def test_http_get_json_rejects_credentials_in_the_url(self):
+        dd = self._load_dashboard()
+        # A URL like http://user:pass@host/ invites credential confusion, and
+        # urllib can turn it into an Authorization header of its own. The
+        # dashboard has exactly one credential: the bearer token.
+        with self.assertRaises(ValueError) as ctx:
+            dd.http_get_json("http://user:pass@127.0.0.1:9/api/events", "t")
+        self.assertIn("credential", str(ctx.exception).lower())
+
+    def test_configure_refuses_a_non_http_server_before_saving(self):
+        proc = run_dashboard(
+            self.home, "--configure",
+            "--server", "file:///etc/passwd",
+            "--token", "supersecret-token",
+        )
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("scheme", proc.stdout.lower())
+        self.assertFalse(
+            os.path.exists(os.path.join(self.home, "config.json")),
+            "a rejected server URL was still written to config.json",
+        )
 
     def test_blocklist_rejects_out_of_range_index(self):
         dd = self._load_dashboard()

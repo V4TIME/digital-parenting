@@ -26,7 +26,7 @@
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
 > dashboard. The full suite is **71 tests, 0 failures, 0 skipped** against a
-> live collector, plus 40 collector tests and 21 dashboard regression tests.
+> live collector, plus 40 collector tests and 25 dashboard regression tests.
 > Remaining work is a run on a physical phone; no Android device or KVM is
 > available in the build environment.
 
