@@ -103,6 +103,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-74 | medium | Android | A wrong token, a dead tailnet, or an unreachable collector left the dashboard at "Monitoring: ON" with **no uploads and no message**. `ensureRegistered`/upload failures only wrote `Log.w`; events were correctly kept for retry, but the parent had no way to distinguish "nothing happened" from "nothing is arriving". | failures logged only; warning state did not exist | **Fixed 2026-11-20** — the current upload problem is persisted (`last_upload_error` + timestamp) and shown as an amber dashboard line ("Uploads failing since 12:04 — server answered HTTP 401. Retrying automatically."); it is cleared by any 2xx or reachable-but-rejected batch, and the same marker covers registration failures. Tests: `currentUploadProblemIsVisibleAndClearsWhenFixed`; the live E2E dead-port test now asserts the warning appears and clears after recovery |
 | F-75 | medium | Android | Both capture queues are capped at 200 events, but the eviction was silent: `while (queue.size >= MAX_QUEUE) queue.poll()` threw the **oldest** captured message away with no counter, no dashboard line, and no notification. A phone that was offline for a few minutes (or a very chatty group chat) lost evidence while the UI still promised capture — the same "silent loss" class as F-69, one layer lower. | `queue.poll()` with no accounting | **Fixed 2026-11-20** — evictions are counted and recorded through the durable loss counter with code `0` (`recordLocalLoss`), so the dashboard says "N events were lost locally: the capture queue was full. Check the server connection."; the counter is written only when something was actually evicted. Tests: `aFullCaptureQueueDropsTheOldestEventLoudly` (old shape: `expected:<1> but was:<0>`), `notificationQueueOverflowIsCountedNotSilent` (`expected:<60> but was:<0>`), `localQueueOverflowIsReportedAsLocalNotAsAServerError` |
 | F-76 | low | Both collectors | `authorized()` compared the **whole** `Authorization` value against `"Bearer <token>"`, so the scheme was case-sensitive. RFC 7235 makes auth schemes case-insensitive, and `bearer <token>` / `BEARER <token>` (or extra spaces after the scheme) are valid requests that both collectors answered `401`. The Android client always sends `Bearer`, which is why no test caught it. | exact string compare in Rust and Node | **Fixed 2026-11-21** — both parse the scheme case-insensitively and then compare **only the credential** in constant time (a non-`Bearer` scheme is still rejected). Rust `auth_scheme_is_case_insensitive` fails on the old code; the Node smoke test fails with `scheme bearer was rejected 401 !== 200` |
+| F-77 | medium | Android | The retry queue (`MAX_RETRY = 1000`) evicted its oldest event on overflow with `retryQueue.poll()` and no accounting. Those events had already been **drained out of** the capture queues for upload, so during a long outage the retry queue is their only copy: F-75 made a full capture queue visible, but the last layer still dropped evidence silently. | silent `poll()` in `requeue()` | **Fixed 2026-11-21** — `requeue()` returns the number it had to evict and `requeueOrCount()` records it through `recordLocalLoss`, so the same dashboard line and durable counter cover all three layers. Tests: `retryQueueOverflowIsCountedNotSilent` (old shape `expected:<1> but was:<0>`), `retryCapReportsWhatItEvicts` (`expected:<1> but was:<0>`) |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -1088,6 +1089,43 @@ node: SMOKE FAIL: scheme bearer was rejected
 
 After: `cargo test` → 38 passed; Node smoke prints `SMOKE OK`.
 
+## 5x. Daily audit — 2026-11-21, last silent-loss layer
+
+F-75 counted evictions from the two capture queues. This pass found the layer
+under them.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Retry queue (1000) | `poll()` on overflow, no count | `requeue()` reports evictions; service records them | test fails pre-fix (`1` vs `0`) |
+| Dashboard/notification | Covered only capture queues | Same counter, same wording | lifecycle test asserts the line |
+
+Why this shape:
+
+- **Ordering makes this the worst layer to lose.** `takeUploadBatch()` drains
+  retries first, then the capture queues. By the time an event reaches the
+  retry queue it has left every other buffer, so an eviction there is
+  unrecoverable — exactly the event a parent is most likely to be missing.
+- **Accounting at the boundary, not in the loop.** `requeue()` is a pure
+  companion function used by tests; returning the eviction count keeps it
+  testable without an Android `Context`, while the service-owned
+  `requeueOrCount()` does the prefs write. No callback plumbing, no context in
+  the queue.
+- **One counter still.** A retry overflow is "captured evidence that will not
+  arrive", the same meaning as F-69 (server rejection) and F-75 (capture
+  overflow); the wording already distinguishes local loss from server loss.
+
+Proof against the old shape (return value always `0`, counting call removed):
+
+```
+MonitorServiceLifecycleTest > retryQueueOverflowIsCountedNotSilent FAILED
+    one event over the cap must be counted  expected:<1> but was:<0>
+UploadBatchingTest > retryCapReportsWhatItEvicts FAILED
+    the 1001st event evicts one  expected:<1> but was:<0>
+```
+
+On the fix: `MonitorServiceLifecycleTest tests=7 failures=0`,
+`UploadBatchingTest tests=9 failures=0`.
+
 ## 6. Verification log (this audit)
 
 ```
@@ -1096,15 +1134,15 @@ server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,
               LRU eviction, field clipping, stream limit, liveness)
-android:      69 tests, 0 failures, 0 skipped (with live server)
+android:      71 tests, 0 failures, 0 skipped (with live server)
               4 E2E tests skip when no server is configured
               test classes: Feature1Extraction 15, Feature1Runtime 11,
               Feature3Notification 11, Feature1ServerE2E 4, UploadBatching 8,
-              DashboardActivity 7, MonitorServiceLifecycle 6,
+              DashboardActivity 7, MonitorServiceLifecycle 7,
               SetupActivity 4, WebMonitorActivity 1
 dashboard:    python3 -m unittest termux/test_dashboard.py → 21 passed
 android:      assembleDebug → app-debug.apk 7,400,169 bytes,
-              sha256 aa8c214a...f9ad4
+              sha256 5e8ce1c7...e9baa
 dashboard:    --doctor → healthy exit 0 (7 events / 1 alert / 2 children);
               wrong token exit 3; dead server exit 2; missing token exit 5
               --sync → "Sync complete: 8 new records";

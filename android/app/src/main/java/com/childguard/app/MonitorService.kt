@@ -257,11 +257,22 @@ class MonitorService : Service() {
             return merged
         }
 
-        fun requeue(items: List<JSONObject>) {
+        /**
+         * Return failed-upload events to the head of the next batch.
+         *
+         * Returns how many events the retry cap evicted, so the caller can
+         * count them: during a long outage this queue is the *only* copy of
+         * those events, and dropping the oldest one used to be silent.
+         */
+        internal fun requeue(items: List<JSONObject>): Int {
+            var lost = 0
             for (obj in items) {
-                while (retryQueue.size >= MAX_RETRY) retryQueue.poll()
+                while (retryQueue.size >= MAX_RETRY) {
+                    if (retryQueue.poll() != null) lost += 1
+                }
                 retryQueue.add(obj)
             }
+            return lost
         }
 
         fun start() {
@@ -429,6 +440,16 @@ class MonitorService : Service() {
     }
 
     /**
+     * Requeue after a failed upload and surface anything the retry cap had to
+     * evict. Those events were already drained from the capture queues, so
+     * without this they would be the only silent loss left.
+     */
+    private fun requeueOrCount(items: List<JSONObject>) {
+        val lost = MonitorService.requeue(items)
+        if (lost > 0) recordLocalLoss(this, lost)
+    }
+
+    /**
      * One upload pass. Returns how long to wait before the next pass, so a
      * transient outage backs off instead of hammering the collector.
      */
@@ -438,7 +459,7 @@ class MonitorService : Service() {
         if (merged.isEmpty()) return UPLOAD_INTERVAL_MS
 
         val childId = ensureRegistered() ?: run {
-            requeue(merged)
+            requeueOrCount(merged)
             return nextFailureDelay()
         }
 
@@ -448,7 +469,7 @@ class MonitorService : Service() {
         ) ?: run {
             Log.w(TAG, "invalid server URL configured; keeping events for retry")
             noteUploadError(sp, "invalid server URL in Setup", System.currentTimeMillis())
-            requeue(merged)
+            requeueOrCount(merged)
             return nextFailureDelay()
         }
         val token = sp.getString(ChildGuardApp.KEY_PARENT_TOKEN, "") ?: ""
@@ -487,13 +508,13 @@ class MonitorService : Service() {
                 clearUploadError(sp)
                 if (merged.size > MIN_BATCH) {
                     batchLimit = maxOf(MIN_BATCH, merged.size / 2)
-                    requeue(merged)
+                    requeueOrCount(merged)
                     consecutiveFailures = 0
                     Log.w(TAG, "upload 413; shrinking batch to $batchLimit")
                     return UPLOAD_INTERVAL_MS
                 }
                 Log.w(TAG, "upload 413 even at minimum batch; keeping events")
-                requeue(merged)
+                requeueOrCount(merged)
                 return nextFailureDelay()
             }
 
@@ -503,8 +524,8 @@ class MonitorService : Service() {
                 clearUploadError(sp)
                 if (merged.size > 1) {
                     val half = merged.size / 2
-                    requeue(merged.subList(0, half))
-                    requeue(merged.subList(half, merged.size))
+                    requeueOrCount(merged.subList(0, half))
+                    requeueOrCount(merged.subList(half, merged.size))
                     consecutiveFailures = 0
                     Log.w(TAG, "upload $code; splitting ${merged.size} events into halves")
                     return UPLOAD_INTERVAL_MS
@@ -525,13 +546,13 @@ class MonitorService : Service() {
             // may succeed once the token, URL, or server recovers.
             Log.w(TAG, "upload failed code=$code; retrying with backoff")
             noteUploadError(sp, "server answered HTTP $code", System.currentTimeMillis())
-            requeue(merged)
+            requeueOrCount(merged)
             return nextFailureDelay()
         } catch (e: Exception) {
             Log.w(TAG, "upload error: ${e.message}; retrying with backoff")
             noteUploadError(sp, "cannot reach the server (${e.javaClass.simpleName})",
                 System.currentTimeMillis())
-            requeue(merged)
+            requeueOrCount(merged)
             return nextFailureDelay()
         }
     }

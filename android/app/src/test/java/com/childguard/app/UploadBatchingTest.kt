@@ -30,6 +30,18 @@ class UploadBatchingTest {
         .put("ts", n.toLong())
 
     @Test
+    fun retryCapReportsWhatItEvicts() {
+        // Pure accounting: requeue() returns how many events the cap forced
+        // it to drop, so the service can count them (F-77).
+        assertEquals("a batch below the cap loses nothing",
+            0, MonitorService.requeue((1..1000).map { event(it) }))
+        assertEquals("the 1001st event evicts one",
+            1, MonitorService.requeue(listOf(event(1001))))
+        assertEquals("a two-event overflow evicts two",
+            2, MonitorService.requeue(listOf(event(1002), event(1003))))
+    }
+
+    @Test
     fun batchesAreBoundedAndLoseNothing() {
         val all = (1..600).map { event(it) }
         MonitorService.requeue(all.take(300))

@@ -5,9 +5,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -39,6 +41,9 @@ class MonitorServiceLifecycleTest {
 
     @After
     fun tearDown() {
+        // The retry queue is static: do not leak a 1000-event fill into tests
+        // that run later in the same JVM.
+        MonitorService.drainRetry()
         service.onDestroy()
         MonitorService.stop()
     }
@@ -117,6 +122,41 @@ class MonitorServiceLifecycleTest {
         MonitorService::class.java.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(service)
+
+    @Test
+    fun retryQueueOverflowIsCountedNotSilent() {
+        // MAX_RETRY holds events already drained from the capture queues, so
+        // during a long outage it is their only copy. requeue() poll()ed the
+        // oldest one away with no counter and no warning.
+        prefs.edit()
+            .remove(MonitorService.KEY_DROPPED_EVENTS)
+            .remove(MonitorService.KEY_LAST_REJECTION)
+            .apply()
+        val batch = (1..1001).map {
+            JSONObject()
+                .put("type", "keylog")
+                .put("package", "com.whatsapp")
+                .put("data", "retry-$it")
+                .put("ts", it.toLong())
+        }
+
+        val m = MonitorService::class.java
+            .getDeclaredMethod("requeueOrCount", List::class.java)
+        m.isAccessible = true
+        m.invoke(service, batch)
+
+        assertEquals(
+            "one event over the cap must be counted",
+            1,
+            prefs.getInt(MonitorService.KEY_DROPPED_EVENTS, 0)
+        )
+        val warning = MonitorService.droppedWarning(prefs)
+        assertNotNull("the loss must reach the dashboard", warning)
+        assertTrue(
+            "must be named as a local loss: $warning",
+            warning!!.contains("lost locally")
+        )
+    }
 
     @Test
     fun notificationSurfacesRejectedEvents() {
