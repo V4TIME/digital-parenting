@@ -104,6 +104,7 @@ disclosure or data loss, **medium** = reliability/accuracy with real impact,
 | F-75 | medium | Android | Both capture queues are capped at 200 events, but the eviction was silent: `while (queue.size >= MAX_QUEUE) queue.poll()` threw the **oldest** captured message away with no counter, no dashboard line, and no notification. A phone that was offline for a few minutes (or a very chatty group chat) lost evidence while the UI still promised capture — the same "silent loss" class as F-69, one layer lower. | `queue.poll()` with no accounting | **Fixed 2026-11-20** — evictions are counted and recorded through the durable loss counter with code `0` (`recordLocalLoss`), so the dashboard says "N events were lost locally: the capture queue was full. Check the server connection."; the counter is written only when something was actually evicted. Tests: `aFullCaptureQueueDropsTheOldestEventLoudly` (old shape: `expected:<1> but was:<0>`), `notificationQueueOverflowIsCountedNotSilent` (`expected:<60> but was:<0>`), `localQueueOverflowIsReportedAsLocalNotAsAServerError` |
 | F-76 | low | Both collectors | `authorized()` compared the **whole** `Authorization` value against `"Bearer <token>"`, so the scheme was case-sensitive. RFC 7235 makes auth schemes case-insensitive, and `bearer <token>` / `BEARER <token>` (or extra spaces after the scheme) are valid requests that both collectors answered `401`. The Android client always sends `Bearer`, which is why no test caught it. | exact string compare in Rust and Node | **Fixed 2026-11-21** — both parse the scheme case-insensitively and then compare **only the credential** in constant time (a non-`Bearer` scheme is still rejected). Rust `auth_scheme_is_case_insensitive` fails on the old code; the Node smoke test fails with `scheme bearer was rejected 401 !== 200` |
 | F-77 | medium | Android | The retry queue (`MAX_RETRY = 1000`) evicted its oldest event on overflow with `retryQueue.poll()` and no accounting. Those events had already been **drained out of** the capture queues for upload, so during a long outage the retry queue is their only copy: F-75 made a full capture queue visible, but the last layer still dropped evidence silently. | silent `poll()` in `requeue()` | **Fixed 2026-11-21** — `requeue()` returns the number it had to evict and `requeueOrCount()` records it through `recordLocalLoss`, so the same dashboard line and durable counter cover all three layers. Tests: `retryQueueOverflowIsCountedNotSilent` (old shape `expected:<1> but was:<0>`), `retryCapReportsWhatItEvicts` (`expected:<1> but was:<0>`) |
+| F-78 | **high (phone safety)** | Both collectors | The collector bound `0.0.0.0` by default, so starting it on a shared Wi-Fi (café, hotel, school, office guest SSID) published a service holding a child's messages to every peer on that network. `BIND=` (empty) was worse: it produced `":38080"`, which also binds every interface. Every response carried `Access-Control-Allow-Origin: *`, so any web page opened in a browser on the phone could probe the port (and with the token, read or write events). The token was the only gate, and short tokens are allowed. | `BIND` default `0.0.0.0`, empty ⇒ all interfaces; CORS `*` unconditional | **Fixed 2026-11-21** — loopback is the default (`bind_or_default` in Rust, `BIND || '127.0.0.1'` in Node; blank ⇒ loopback), startup prints how to opt in, and CORS is off unless `CHILDGUARD_CORS=1`. The app is unaffected (it is not a browser); exposing the child's phone is now an explicit `BIND=<tailnet/hotspot IP>`. Tests: `bind_defaults_to_loopback`, `cors_headers_are_opt_in`, Node smoke (no ACAO, loopback bind, LAN probe refused) |
 
 Controls that held up under review: bearer auth is compared in constant time;
 bodies are capped at 2 MiB and headers at 64 KiB; events/alerts/children/dupe
@@ -1126,10 +1127,59 @@ UploadBatchingTest > retryCapReportsWhatItEvicts FAILED
 On the fix: `MonitorServiceLifecycleTest tests=7 failures=0`,
 `UploadBatchingTest tests=9 failures=0`.
 
+## 5y. Daily audit — 2026-11-21, phone-safety defaults
+
+The threat here is not "someone reads the events"; it is "someone reaches a
+service on the phone". A collector that is reachable from a shared network is
+an exposed process, however good its token is.
+
+| Area | What was wrong | Fix | Proof |
+|---|---|---|---|
+| Bind address | `0.0.0.0` by default; `BIND=` also all interfaces | loopback default, explicit opt-in | live: LAN refused, loopback 200 |
+| CORS | `*` on every response, including SSE/preflight | off unless `CHILDGUARD_CORS=1` | unit + smoke (`'*' !== undefined`) |
+| Non-Bearer clients | allowed by RFC 7235 (F-76) | unchanged | — |
+| Shell surface | none existed | verified again | no `exec`/`Command` in either collector; APK string scan |
+
+Why these shapes:
+
+- **Secure default beats documentation.** A parent who types
+  `./childguard-server` on hotel Wi-Fi must not have to remember `BIND`.
+  Loopback also makes the same-phone setup (app + Termux on one device) work
+  with zero network exposure.
+- **The opt-in is an address, not a boolean.** `BIND=100.x.y.z` binds *only*
+  the tailnet interface, so LAN peers cannot connect even if they scan the
+  port, and `BIND=192.168.43.1` does the same for a hotspot. `0.0.0.0` still
+  works, but it is now a deliberate act.
+- **CORS is a browser capability, and nothing here is a browser.** The
+  Android app and the Python dashboard are native clients. Sending `*` only
+  served a hypothetical web UI while giving every page on the phone a way to
+  talk to the collector. Opt-in costs one env var if such a UI ever ships.
+- **No command execution to remove.** The audit re-checked both collectors and
+  the APK: no `Command::new`, `exec`, `spawn`, `os.system` beyond `clear`.
+  The phone-safety work is therefore networking, not sandboxing.
+
+Live proof, same binary, three runs:
+
+```
+default      -> "running on http://127.0.0.1:38130"
+                loopback=200   lan=000 (refused)   access_control_count=0
+CORS=1       -> Access-Control-Allow-Origin: *
+BIND=192.168.1.43 -> lan=200   loopback=000 (bound to that interface only)
+```
+
+Old shapes, new tests:
+
+```
+node: SMOKE FAIL: '* ' !== undefined        (CORS was on by default)
+node: SMOKE FAIL: collector did not bind loopback by default:
+      ChildGuard server running on http://0.0.0.0:38999
+rust: bind_defaults_to_loopback / cors_headers_are_opt_in
+```
+
 ## 6. Verification log (this audit)
 
 ```
-server-rust:  cargo test            → 38 passed; 0 failed
+server-rust:  cargo test            → 40 passed; 0 failed
 server-rust:  cargo clippy -D warnings → clean
 node server:  node server/smoke_test.js → SMOKE OK (auth, token
               non-disclosure, dedupe, caps, limit parsing, ts coercion,

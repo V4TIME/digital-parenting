@@ -325,18 +325,30 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn json_response(conn: &mut TcpStream, status: u16, value: &serde_json::Value) {
-    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
-    write_html_response(conn, status, "application/json", &body, true);
+/// CORS is off by default. No first-party client needs it (the Android app and
+/// the Python dashboard are not browsers), and `Access-Control-Allow-Origin: *`
+/// on a loopback/private-network API lets any web page the user visits probe
+/// the collector and, if it learns the token, read or write events. Opt in only
+/// if a browser UI is actually being served: CHILDGUARD_CORS=1.
+fn cors_enabled() -> bool {
+    matches!(env::var("CHILDGUARD_CORS").as_deref(), Ok("1"))
 }
 
-fn write_html_response(
-    conn: &mut TcpStream,
-    status: u16,
-    ctype: &str,
-    body: &[u8],
-    cors: bool,
-) {
+fn json_response(conn: &mut TcpStream, status: u16, value: &serde_json::Value) {
+    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{\"error\":\"encode\"}".to_vec());
+    write_html_response(conn, status, "application/json", &body, cors_enabled());
+}
+
+/// Bind address, with loopback as the safe default. An empty `BIND=`
+/// previously produced `":38080"`, which binds **every** interface — the
+/// opposite of what an empty value should mean.
+fn bind_or_default(raw: Option<String>) -> String {
+    raw.filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+/// Build the response head so the CORS decision is testable without a socket.
+fn response_head(status: u16, ctype: &str, body_len: usize, cors: bool) -> String {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -354,7 +366,7 @@ fn write_html_response(
         status,
         reason,
         ctype,
-        body.len()
+        body_len
     );
     if cors {
         head.push_str("Access-Control-Allow-Origin: *\r\n");
@@ -362,6 +374,17 @@ fn write_html_response(
         head.push_str("Access-Control-Allow-Headers: Content-Type,Authorization\r\n");
     }
     head.push_str("\r\n");
+    head
+}
+
+fn write_html_response(
+    conn: &mut TcpStream,
+    status: u16,
+    ctype: &str,
+    body: &[u8],
+    cors: bool,
+) {
+    let head = response_head(status, ctype, body.len(), cors);
     let w1 = conn.write_all(head.as_bytes());
     let w2 = conn.write_all(body);
     let w3 = conn.flush();
@@ -968,8 +991,17 @@ fn handle_sse(
             return;
         }
     }
+    let cors_head = if cors_enabled() {
+        "Access-Control-Allow-Origin: *\r\n"
+    } else {
+        ""
+    };
     let _ = conn.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}\r\n",
+            cors_head
+        )
+        .as_bytes(),
     );
     let _ = conn.write_all(format!("data: {}\n\n", serde_json::json!({ "type": "connected", "stats": handle_stats(state).1 })).as_bytes());
     let _ = conn.flush();
@@ -1000,7 +1032,11 @@ fn handle_sse(
 // ---------------------------------------------------------------------------
 fn main() {
     let port: u16 = env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(38080);
-    let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+    // Loopback by default: the collector is a phone-resident service holding
+    // a child's messages, so it must not be reachable from a shared Wi-Fi just
+    // because it was started. Bind the tailnet/hotspot address explicitly to
+    // accept the child's phone.
+    let bind = bind_or_default(env::var("BIND").ok());
     let (token, token_generated) = match env::var("CHILDGUARD_TOKEN") {
         Ok(t) if !t.is_empty() => (t, false),
         _ => (random_hex(24), true),
@@ -1051,6 +1087,11 @@ fn main() {
 
     let listener = TcpListener::bind(format!("{}:{}", bind, port)).expect("bind failed");
     eprintln!("ChildGuard server (rust) running on http://{}:{}", bind, port);
+    if bind == "127.0.0.1" || bind == "::1" {
+        eprintln!(
+            "  loopback only: set BIND=<tailnet-or-hotspot-ip> to accept the child's phone"
+        );
+    }
     if token_generated {
         // Only echo a token the operator has never seen. A token they set
         // themselves does not belong in log files / journals.
@@ -1100,9 +1141,18 @@ fn main() {
             };
 
             if req.method == "OPTIONS" {
-                let _ = conn.write_all(
-                    b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type,Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                // No Access-Control-* headers unless CORS was explicitly
+                // enabled, so a browser preflight fails closed.
+                let mut head = String::from(
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n",
                 );
+                if cors_enabled() {
+                    head.push_str("Access-Control-Allow-Origin: *\r\n");
+                    head.push_str("Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n");
+                    head.push_str("Access-Control-Allow-Headers: Content-Type,Authorization\r\n");
+                }
+                head.push_str("\r\n");
+                let _ = conn.write_all(head.as_bytes());
                 return;
             }
 
@@ -1183,6 +1233,31 @@ mod tests {
         assert!(!constant_time_eq("abc", "abcd"));
         assert!(!constant_time_eq("", "a"));
         assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn bind_defaults_to_loopback() {
+        // Starting the collector must not silently expose it to the Wi-Fi.
+        assert_eq!("127.0.0.1", bind_or_default(None));
+        assert_eq!("127.0.0.1", bind_or_default(Some(String::new())));
+        assert_eq!("127.0.0.1", bind_or_default(Some("   ".to_string())));
+        // An explicit address is honoured, including a tailnet one.
+        assert_eq!("100.64.0.7", bind_or_default(Some("100.64.0.7".to_string())));
+        assert_eq!("0.0.0.0", bind_or_default(Some("0.0.0.0".to_string())));
+    }
+
+    #[test]
+    fn cors_headers_are_opt_in() {
+        // A browser on the phone or the LAN must not be able to read this API
+        // just because it exists. No first-party client is a browser.
+        let plain = response_head(200, "application/json", 2, false);
+        assert!(
+            !plain.contains("Access-Control-Allow-Origin"),
+            "CORS header was sent without opt-in:\n{plain}"
+        );
+        let cors = response_head(200, "application/json", 2, true);
+        assert!(cors.contains("Access-Control-Allow-Origin: *"));
+        assert!(cors.contains("Access-Control-Allow-Headers: Content-Type,Authorization"));
     }
 
     #[test]

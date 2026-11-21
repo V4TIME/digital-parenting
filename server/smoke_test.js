@@ -5,6 +5,7 @@
 // constant-time auth; body/child caps; idempotent retries; timestamp clamping.
 const { spawn } = require('child_process');
 const http = require('http');
+const os = require('os');
 const assert = require('assert');
 
 const PORT = 38999;
@@ -38,7 +39,7 @@ function request(method, path, body, token = TOKEN) {
     }, res => {
       let out = '';
       res.on('data', c => out += c);
-      res.on('end', () => resolve({ code: res.statusCode, body: out }));
+      res.on('end', () => resolve({ code: res.statusCode, body: out, headers: res.headers }));
     });
     req.on('error', reject);
     if (data !== null) req.write(data);
@@ -68,6 +69,30 @@ function openStream() {
   assert.ok(!health.body.includes(TOKEN), '/health leaked the token');
   assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(health.body), 'token'),
     '/health returned a token field');
+
+  // 1b. Safe defaults: loopback bind, and no CORS for browser callers.
+  assert.strictEqual(
+    health.headers['access-control-allow-origin'], undefined,
+    'CORS is enabled by default; a web page could probe the collector');
+  assert.ok(
+    serverOutput.includes(`http://127.0.0.1:${PORT}`),
+    'collector did not bind loopback by default: ' + serverOutput.split('\n')[0]);
+
+  // 1c. A non-loopback local address must refuse the connection. This is the
+  //     property that keeps the phone off a shared Wi-Fi.
+  const lan = Object.values(os.networkInterfaces())
+    .flat()
+    .find(i => i && i.family === 'IPv4' && !i.internal);
+  if (lan) {
+    const refused = await new Promise(resolve => {
+      const probe = http.get(
+        { host: lan.address, port: PORT, path: '/health', timeout: 1500 },
+        res => { res.resume(); resolve(false); });
+      probe.on('timeout', () => { probe.destroy(); resolve(true); });
+      probe.on('error', () => resolve(true));
+    });
+    assert.ok(refused, `collector was reachable on the LAN address ${lan.address}`);
+  }
 
   // 2. Register must not echo the token.
   const reg = await request('POST', '/api/register', { name: 'Eli' });

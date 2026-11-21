@@ -2,6 +2,15 @@ const http = require('http');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 38080;
+// Loopback by default: the collector is a phone-resident service holding a
+// child's messages, so it must not be reachable from a shared Wi-Fi just
+// because it was started. Bind the tailnet/hotspot address explicitly to
+// accept the child's phone.
+const BIND = process.env.BIND || '127.0.0.1';
+// CORS is off by default. No first-party client needs it (the Android app and
+// the Python dashboard are not browsers); `Access-Control-Allow-Origin: *` on
+// a private-network API lets any web page the user visits probe the collector.
+const CORS = process.env.CHILDGUARD_CORS === '1';
 const TOKEN_GENERATED = !process.env.CHILDGUARD_TOKEN;
 const AUTH_TOKEN = process.env.CHILDGUARD_TOKEN || crypto.randomBytes(24).toString('hex');
 
@@ -223,14 +232,16 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
   if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+    if (CORS) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+    }
     res.writeHead(204);
     res.end();
     return;
   }
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (CORS) res.setHeader('Access-Control-Allow-Origin', '*');
 
   if (url.pathname !== '/health' && !authorized(req)) {
     sendJson(res, 401, { error: 'unauthorized' });
@@ -363,8 +374,11 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, { error: 'not found' });
 });
 
-server.listen(PORT, () => {
-  console.log(`ChildGuard server running on http://0.0.0.0:${PORT}`);
+server.listen(PORT, BIND, () => {
+  console.log(`ChildGuard server running on http://${BIND}:${PORT}`);
+  if (BIND === '127.0.0.1' || BIND === '::1') {
+    console.log('  loopback only: set BIND=<tailnet-or-hotspot-ip> to accept the child\'s phone');
+  }
   if (TOKEN_GENERATED) {
     console.log(`Generated parent token (set CHILDGUARD_TOKEN to choose one): ${AUTH_TOKEN}`);
   } else if (AUTH_TOKEN.length < 16) {

@@ -26,7 +26,7 @@
 > **Status:** Feature 1 — accessibility capture — is verified end to end:
 > real Android runtime events → bounded upload → Rust collector → Termux
 > dashboard. The full suite is **71 tests, 0 failures, 0 skipped** against a
-> live collector, plus 38 collector tests and 21 dashboard regression tests.
+> live collector, plus 40 collector tests and 21 dashboard regression tests.
 > Remaining work is a run on a physical phone; no Android device or KVM is
 > available in the build environment.
 
@@ -34,7 +34,7 @@
 
 | Principle | What that means |
 |---|---|
-| **Private by construction** | No account, no cloud, no telemetry. The app speaks HTTP to a collector you run, over a Tailscale/WireGuard tailnet. The collector writes `state.json` owner-only (`0600`) and never echoes the parent token. |
+| **Private by construction** | No account, no cloud, no telemetry. The app speaks HTTP to a collector you run, over a Tailscale/WireGuard tailnet or a hotspot. The collector binds `127.0.0.1` unless you name an interface, needs a bearer token on every route, sends no CORS headers, and cannot execute commands. It writes `state.json` owner-only (`0600`) and never echoes the parent token. |
 | **Honest about trade-offs** | [`AUDIT.md`](AUDIT.md) is a real audit: it found a reverse-shell prototype, token leaks, a collector crash, and a disk-bound write path. It also states the measured result that **Node serves more writes per second than this Rust server** — Rust is kept for memory and footprint, not hype. |
 | **Built for a phone** | 681 kB collector binary, 768 kB idle RSS, 250-event upload batches with retry-first queues, and bounded view traversal so a huge chat or browser tree cannot turn the accessibility callback into an ANR. |
 | **A dashboard, not a web page** | `termux/dashboard.py` is pure Python standard library and prints to the terminal. One command checks health + token before you trust a blank screen. |
@@ -76,15 +76,38 @@ owner-only file. The dashboard pulls from it and keeps a local SQLite copy.
 ```bash
 cd server-rust
 cargo build --release --offline
-CHILDGUARD_TOKEN='use-a-long-random-secret' ./target/release/childguard-server
-# listening on :38080; a token you supply is never printed or logged
+CHILDGUARD_TOKEN="$(head -c 32 /dev/urandom | base64)"   ./target/release/childguard-server
+# listening on 127.0.0.1:38080 (loopback only); the token is never printed
 ```
 
-The legacy Node collector (`server/index.js`) exposes the same API:
+**Phone safety defaults.** The collector holds a child's messages, so it must
+not become a service on the Wi-Fi just because it was started:
+
+| Default | What it means |
+|---|---|
+| `BIND=127.0.0.1` | Only processes on this phone can connect. Nothing on the LAN, no hotspot client, no browser. |
+| auth required | Every `/api/*` route needs `Authorization: Bearer <token>`; only `/health` is open (it returns `ok` and an uptime, nothing else). |
+| no CORS | No `Access-Control-*` headers, so a web page cannot read the API even if it guesses the port. `CHILDGUARD_CORS=1` opts in for a browser UI. |
+| no shell | Neither collector can execute a command: they parse HTTP/JSON and write one state file. There is no remote-command endpoint in the APK either. |
+
+**Exposing it to the child's phone.** Bind the one address that phone reaches —
+never `0.0.0.0` on a network you do not control:
+
+```bash
+BIND=100.x.y.z  ./target/release/childguard-server   # Tailscale/tailnet IP only
+BIND=192.168.43.1 ./target/release/childguard-server # hotspot gateway only
+```
+
+Then put that same URL in the app's Setup screen. With no `BIND`, the app and
+the collector must be on the same phone and use `http://127.0.0.1:38080`.
+
+The legacy Node collector (`server/index.js`) exposes the same API and the
+same defaults (`-r` not needed; it is plain CommonJS):
 
 ```bash
 cd server
-CHILDGUARD_TOKEN='use-a-long-random-secret' node index.js
+CHILDGUARD_TOKEN="$(head -c 32 /dev/urandom | base64)" node index.js
+# BIND=192.168.43.1 node index.js   # same opt-in as Rust
 ```
 
 The Rust build is the deployment target: same behaviour, 681 kB binary,
@@ -188,7 +211,7 @@ method are in [`AUDIT.md`](AUDIT.md) and [`RUNTIME_TEST.md`](RUNTIME_TEST.md).
 
 | Layer | Command | Last result |
 |---|---|---|
-| Collector unit tests | `cargo test --offline` | **38 passed, 0 failed** |
+| Collector unit tests | `cargo test --offline` | **40 passed, 0 failed** |
 | Dashboard tests | `python3 -m unittest termux/test_dashboard.py` | **21 passed, 0 failed** |
 | Collector lints | `cargo clippy --offline -- -D warnings` | **exit 0** |
 | Legacy collector | `node server/smoke_test.js` | **SMOKE OK** |
